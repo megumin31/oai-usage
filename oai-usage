@@ -1,0 +1,1440 @@
+#!/usr/bin/env python3
+"""Local Codex usage, Standard API-equivalent costs, and account quotas.
+
+Python 3.9+, standard library only. No conversation content is retained or sent.
+The parser, accounting, pricing, quota transport, and CLI are independent layers.
+"""
+from __future__ import annotations
+
+import argparse
+import copy
+import json
+import math
+import os
+import re
+import selectors
+import shutil
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+import unicodedata
+from bisect import bisect_left
+from collections import Counter, defaultdict
+from dataclasses import asdict, dataclass, field, replace
+from datetime import date, datetime, timedelta, timezone
+from decimal import Decimal, InvalidOperation
+from pathlib import Path
+from typing import Any, Optional
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+
+VERSION = "0.0.1"
+UTC = timezone.utc
+FIELDS = ("input_tokens", "cached_input_tokens", "cache_write_input_tokens",
+          "output_tokens", "reasoning_output_tokens", "total_tokens")
+PRICE_DATE = "2026-09-22"
+
+
+def timestamp(value: Any) -> Optional[datetime]:
+    if not isinstance(value, str):
+        return None
+    try:
+        dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        return (dt if dt.tzinfo else dt.replace(tzinfo=UTC)).astimezone(UTC)
+    except (ValueError, OverflowError):
+        return None
+
+
+def finite(value: Any) -> Optional[float]:
+    if isinstance(value, bool) or value is None:
+        return None
+    try:
+        number = float(value)
+        return number if math.isfinite(number) else None
+    except (TypeError, ValueError, OverflowError):
+        return None
+
+
+def first(raw: dict, *keys: str) -> Any:
+    return next((raw[k] for k in keys if raw.get(k) is not None), None)
+
+
+@dataclass(frozen=True)
+class Usage:
+    input_tokens: int = 0
+    cached_input_tokens: int = 0
+    cache_write_input_tokens: int = 0
+    output_tokens: int = 0
+    reasoning_output_tokens: int = 0
+    total_tokens: int = 0
+
+    @classmethod
+    def parse(cls, raw: Any) -> Optional[Usage]:
+        if not isinstance(raw, dict) or not any(k in raw for k in FIELDS):
+            return None
+        values = {}
+        for key in FIELDS:
+            value = raw.get(key, 0)
+            if isinstance(value, bool) or not isinstance(value, (int, float)):
+                return None
+            if value < 0 or value > 2**63 - 1 or not math.isfinite(value) or int(value) != value:
+                return None
+            values[key] = int(value)
+        if "total_tokens" not in raw:
+            values["total_tokens"] = values["input_tokens"] + values["output_tokens"]
+        if values["total_tokens"] != values["input_tokens"] + values["output_tokens"]:
+            return None
+        if values["cached_input_tokens"] + values["cache_write_input_tokens"] > values["input_tokens"]:
+            return None
+        if values["reasoning_output_tokens"] > values["output_tokens"]:
+            return None
+        return cls(**values)
+
+    def __add__(self, other: Usage) -> Usage:
+        return Usage(*(getattr(self, k) + getattr(other, k) for k in FIELDS))
+
+    def difference(self, previous: Usage) -> Usage:
+        values = {k: max(0, getattr(self, k) - getattr(previous, k)) for k in FIELDS}
+        values["cached_input_tokens"] = min(values["cached_input_tokens"], values["input_tokens"])
+        values["cache_write_input_tokens"] = min(values["cache_write_input_tokens"],
+                                                 values["input_tokens"] - values["cached_input_tokens"])
+        values["reasoning_output_tokens"] = min(values["reasoning_output_tokens"], values["output_tokens"])
+        values["total_tokens"] = values["input_tokens"] + values["output_tokens"]
+        return Usage(**values)
+
+    @property
+    def uncached(self) -> int:
+        return self.input_tokens - self.cached_input_tokens - self.cache_write_input_tokens
+
+
+@dataclass(frozen=True)
+class Calendar:
+    name: str = "local"
+    zone: Any = None
+
+    @classmethod
+    def make(cls, name: str) -> Calendar:
+        return cls() if name == "local" else cls(name, ZoneInfo(name))
+
+    def local(self, dt: datetime) -> datetime:
+        # zone=None uses the OS timezone for THIS instant, including historical DST.
+        return dt.astimezone(self.zone)
+
+    def midnight(self, day: date) -> datetime:
+        dt = datetime.combine(day, datetime.min.time())
+        if self.zone is not None:
+            dt = dt.replace(tzinfo=self.zone)
+        return dt.astimezone(UTC)
+
+    def day(self, dt: Optional[datetime]) -> str:
+        return self.local(dt).date().isoformat() if dt else "unknown"
+
+    def display(self, dt: Optional[datetime]) -> str:
+        return self.local(dt).strftime("%Y-%m-%d %H:%M %Z") if dt else "unbounded"
+
+
+@dataclass(frozen=True)
+class Snapshot:
+    at: Optional[datetime]
+    model: str
+    cumulative: Usage
+    last: Optional[Usage]
+    inherited: bool = False
+    context_window: int = 0
+
+
+@dataclass
+class Rollout:
+    path: Path
+    session_id: str = ""
+    parent_id: Optional[str] = None
+    created_at: Optional[datetime] = None
+    model: str = "unknown"
+    metadata_seen: bool = False
+    snapshots: list = field(default_factory=list)
+    limits: dict = field(default_factory=dict)
+    issues: Counter = field(default_factory=Counter)
+    offset: int = 0
+    signature: tuple = ()
+
+    def ingest(self, record: Any) -> None:
+        if not isinstance(record, dict) or not isinstance(record.get("payload"), dict):
+            return
+        payload = record["payload"]
+        at = timestamp(record.get("timestamp"))
+        kind = record.get("type")
+        if kind == "session_meta":
+            if self.metadata_seen:
+                return  # Fork history may contain an older parent's session_meta.
+            self.metadata_seen = True
+            own = payload.get("id")
+            if not isinstance(own, str) or not own:
+                match = re.search(r"([0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12})$", self.path.stem)
+                own = match[1] if match else payload.get("session_id")
+            self.session_id = own if isinstance(own, str) and own else str(self.path.resolve())
+            self.created_at = timestamp(payload.get("timestamp")) or at
+            source = payload.get("source")
+            spawn = source.get("subagent", {}) if isinstance(source, dict) else {}
+            spawn = spawn.get("thread_spawn", {}) if isinstance(spawn, dict) else {}
+            parent = payload.get("forked_from_id") or (spawn.get("parent_thread_id") if isinstance(spawn, dict) else None)
+            if not parent and payload.get("session_id") != self.session_id:
+                parent = payload.get("session_id")
+            self.parent_id = parent if isinstance(parent, str) and parent != self.session_id else None
+        elif kind == "turn_context":
+            model = payload.get("model")
+            settings = payload.get("thread_settings")
+            if not model and isinstance(settings, dict):
+                model = settings.get("model")
+            if isinstance(model, str) and model:
+                self.model = model
+        elif kind == "event_msg" and payload.get("type") == "token_count":
+            inherited = bool(self.parent_id and self.created_at and at and at < self.created_at)
+            if not inherited:
+                bucket = normalize_bucket(payload.get("rate_limits"))
+                if bucket and at:
+                    old = self.limits.get(bucket["limit_id"])
+                    if not old or at >= timestamp(old["observed_at"]):
+                        bucket["observed_at"] = at.isoformat()
+                        self.limits[bucket["limit_id"]] = bucket
+            info = payload.get("info")
+            if not isinstance(info, dict):
+                return
+            current = Usage.parse(info.get("total_token_usage"))
+            if current is None:
+                self.issues["invalid_usage_snapshots"] += 1
+                return
+            last = Usage.parse(info.get("last_token_usage"))
+            window = finite(info.get("model_context_window")) or 0
+            self.snapshots.append(Snapshot(at, self.model, current, last, inherited, max(0, int(window))))
+
+
+class Scanner:
+    """Append-only JSONL cache; no stdout, network, or conversation retention."""
+
+    def __init__(self) -> None:
+        self.cache = {}
+        self.issues = Counter()
+        self.bytes_read = 0
+        self.revision = 0
+
+    def scan(self, roots: list) -> list:
+        self.issues = Counter()
+        paths = set()
+        for root in roots:
+            if not root.is_dir():
+                self.issues["missing_roots"] += 1
+                continue
+            try:
+                paths.update(p.resolve() for p in root.rglob("*.jsonl") if p.is_file())
+            except OSError:
+                self.issues["unreadable_roots"] += 1
+        for deleted in self.cache.keys() - paths:
+            del self.cache[deleted]
+            self.revision += 1
+        found = []
+        for path in sorted(paths):
+            try:
+                stat = path.stat()
+                sig = (stat.st_dev, stat.st_ino, stat.st_size, stat.st_mtime_ns)
+                rollout = self.cache.get(path)
+                if rollout is not None and rollout.signature == sig:
+                    found.append(rollout)
+                    continue
+                before = self._state(rollout)
+                if rollout is None or sig[:2] != rollout.signature[:2] or sig[2] < rollout.offset or (
+                    sig[2] == rollout.signature[2] and sig[3] != rollout.signature[3]
+                ):
+                    rollout = Rollout(path, session_id=str(path))
+                with path.open("rb") as stream:
+                    stream.seek(rollout.offset)
+                    while True:
+                        line = stream.readline()
+                        self.bytes_read += len(line)
+                        if not line:
+                            break
+                        relevant = any(word in line for word in (b'"session_meta"', b'"turn_context"', b'"token_count"'))
+                        if not line.endswith(b"\n"):
+                            # Leave an incomplete trailing record for the next append.
+                            try:
+                                record = json.loads(line)
+                            except (ValueError, UnicodeDecodeError):
+                                rollout.issues["pending_partial_line"] = 1
+                                break
+                            rollout.issues.pop("pending_partial_line", None)
+                            if relevant:
+                                rollout.ingest(record)
+                        elif relevant:
+                            try:
+                                rollout.ingest(json.loads(line))
+                            except (ValueError, UnicodeDecodeError, RecursionError):
+                                rollout.issues["malformed_json_lines"] += 1
+                            rollout.issues.pop("pending_partial_line", None)
+                        rollout.offset = stream.tell()
+                rollout.signature = sig
+                if self._state(rollout) != before:
+                    self.revision += 1
+                self.cache[path] = rollout
+                found.append(rollout)
+            except OSError:
+                self.issues["unreadable_files"] += 1
+                if path in self.cache:
+                    del self.cache[path]
+                    self.revision += 1
+        return found
+
+    @staticmethod
+    def _state(rollout: Optional[Rollout]) -> tuple:
+        if rollout is None:
+            return ()
+        return (rollout.session_id, rollout.parent_id, rollout.created_at,
+                tuple(rollout.snapshots), tuple(sorted(rollout.issues.items())))
+
+
+@dataclass(frozen=True)
+class Event:
+    session_id: str
+    at: Optional[datetime]
+    model: str
+    usage: Usage
+    request_input: Optional[int]
+    reset: bool = False
+
+
+@dataclass
+class Session:
+    session_id: str
+    parent_id: Optional[str]
+    created_at: Optional[datetime]
+    paths: list
+    events: list = field(default_factory=list)
+    context_windows: set = field(default_factory=set)
+
+
+def account(rollouts: list) -> tuple:
+    """Union overlapping snapshots BEFORE differencing cumulative counters."""
+    grouped = defaultdict(list)
+    issues = Counter()
+    for rollout in rollouts:
+        grouped[rollout.session_id].append(rollout)
+        issues.update(rollout.issues)
+    sessions = []
+    for sid, files in sorted(grouped.items()):
+        created = [r.created_at for r in files if r.created_at]
+        session = Session(sid, next((r.parent_id for r in files if r.parent_id), None),
+                          min(created) if created else None, sorted(str(r.path) for r in files))
+        unique = {}
+        request_conflicts = set()
+        model_conflicts = set()
+        snapshots = []
+        for r in files:
+            first_own = True
+            for sequence, snap in enumerate(r.snapshots):
+                segment_start = r.created_at if first_own and not snap.inherited else None
+                if not snap.inherited:
+                    first_own = False
+                if snap.at is None:
+                    # No timestamp: equal counters can legitimately occur after a reset.
+                    snapshots.append((str(r.path), sequence, snap, segment_start))
+                    continue
+                key = (snap.at, snap.cumulative)
+                old = unique.get(key)
+                if old is not None:
+                    issues["duplicate_snapshots_removed"] += 1
+                    prior = old[2]
+                    last = prior.last or snap.last
+                    if prior.last is not None and snap.last is not None and prior.last != snap.last:
+                        request_conflicts.add(key)
+                        issues["conflicting_request_metadata"] += 1
+                    if key in request_conflicts:
+                        last = None
+                    model = snap.model if prior.model == "unknown" else prior.model
+                    if prior.model != "unknown" and snap.model != "unknown" and canonical_model(prior.model) != canonical_model(snap.model):
+                        model_conflicts.add(key)
+                        issues["conflicting_model_metadata"] += 1
+                    if key in model_conflicts:
+                        model = "unknown"
+                    merged = replace(prior, model=model, last=last,
+                                     context_window=max(prior.context_window, snap.context_window),
+                                     inherited=prior.inherited and snap.inherited)
+                    starts = [v for v in (old[3], segment_start) if v is not None]
+                    unique[key] = (old[0], old[1], merged, min(starts) if starts else None)
+                else:
+                    unique[key] = (str(r.path), sequence, snap, segment_start)
+        snapshots.extend(unique.values())
+        snapshots.sort(key=lambda item: (item[2].at or datetime.max.replace(tzinfo=UTC), item[0], item[1]))
+        previous = None
+        previous_at = None
+        own_seen = False
+        pending_reset = False
+        for _, _, snap, segment_start in snapshots:
+            cur = snap.cumulative
+            # A positive reset requires a new rollout's creation boundary after
+            # the previous event AND a fresh single-request cumulative baseline.
+            new_segment = bool(segment_start and snap.at and previous_at and
+                               previous_at < segment_start <= snap.at and snap.last == cur)
+            reset = bool(previous is not None and (
+                cur.total_tokens < previous.total_tokens or cur.input_tokens < previous.input_tokens or
+                cur.output_tokens < previous.output_tokens or new_segment
+            ))
+            delta = cur if previous is None or reset else cur.difference(previous)
+            if previous is not None and not reset and any(
+                getattr(cur, k) < getattr(previous, k) for k in FIELDS
+            ):
+                issues["counter_component_corrections"] += 1
+            if not snap.inherited and not own_seen and session.parent_id and previous is None:
+                # A fork may retain the parent's cumulative baseline without replaying
+                # the parent's token events. Only the child's last request is attributable.
+                if snap.last and snap.last.total_tokens <= cur.total_tokens:
+                    delta = snap.last
+                    if cur.total_tokens > delta.total_tokens:
+                        issues["inherited_baseline_tokens_excluded"] += cur.total_tokens - delta.total_tokens
+                elif cur.total_tokens:
+                    issues["unattributed_fork_baseline_tokens"] += cur.total_tokens
+                    delta = Usage()
+            previous = cur  # Zero is a real snapshot, including a counter reset.
+            previous_at = snap.at
+            if snap.inherited:
+                issues["inherited_snapshots_excluded"] += 1
+                continue
+            own_seen = True
+            pending_reset = pending_reset or reset
+            if snap.context_window:
+                session.context_windows.add(snap.context_window)
+            if not delta.total_tokens:
+                continue
+            request_input = None
+            if snap.last and (snap.last.input_tokens, snap.last.output_tokens) == (delta.input_tokens, delta.output_tokens):
+                request_input = snap.last.input_tokens
+            elif snap.last and snap.last.total_tokens > delta.total_tokens:
+                issues["request_detail_exceeds_delta"] += 1
+            elif snap.last is None:
+                # A cumulative delta can contain multiple requests. For <= threshold,
+                # none can individually exceed that threshold; larger deltas are unknown.
+                issues["events_without_request_detail"] += 1
+            session.events.append(Event(sid, snap.at, snap.model, delta, request_input, pending_reset))
+            pending_reset = False
+        if session.events:
+            sessions.append(session)
+    return sessions, issues
+
+
+def canonical_model(model: str) -> str:
+    name = model.strip().lower().replace("_", "-")
+    name = re.sub(r"^gpt(?=\d)", "gpt-", name)
+    name = re.sub(r"-(?:preview|latest|\d{4}-\d{2}-\d{2}|\d{8})$", "", name)
+    return "gpt-6-astra" if name in ("astra", "gpt-astra") else name
+
+
+@dataclass(frozen=True)
+class Price:
+    input: Decimal
+    cached: Decimal
+    output: Decimal
+    write: Optional[Decimal] = None
+    long_threshold: Optional[int] = 272000
+    long_scope: str = "request"
+    source: str = "custom"
+
+
+def default_prices() -> dict:
+    result = {}
+    for model, values in {
+        "gpt-6-astra": ("10", "1", "50", "12.5"),
+        "gpt-5.6-sol": ("4", ".4", "20", "5"),
+        "gpt-5.6-terra": ("2", ".2", "12", "2.5"),
+        "gpt-5.6-luna": (".2", ".02", "1.2", ".25"),
+        "gpt-5.5": ("5", ".5", "30", None),
+        "gpt-5.4": ("2.5", ".25", "15", None),
+    }.items():
+        nums = [Decimal(x) if x is not None else None for x in values]
+        result[model] = Price(*nums, long_scope="session" if model in ("gpt-5.5", "gpt-5.4") else "request",
+                              source=f"https://developers.openai.com/api/docs/models/{model}")
+    return result
+
+
+def price_overrides(values: list) -> dict:
+    prices = default_prices()
+    for spec in values:
+        try:
+            model, rates = spec.split("=", 1)
+            model = canonical_model(model)
+            numbers = [Decimal(v.strip()) for v in rates.split(",")]
+            if not model or len(numbers) not in (3, 4) or any(not n.is_finite() or n < 0 or n > Decimal("1e9") for n in numbers):
+                raise ValueError()
+        except (ValueError, InvalidOperation):
+            raise ValueError(f"Invalid price {spec!r}; use MODEL=IN,CACHED,OUT[,WRITE] with finite, nonnegative rates")
+        old = prices.get(model)
+        write = numbers[3] if len(numbers) == 4 else (numbers[0] * Decimal("1.25") if old and old.write is not None else None)
+        prices[model] = Price(*numbers[:3], write, old.long_threshold if old else None,
+                              old.long_scope if old else "request", "custom")
+    return prices
+
+
+@dataclass(frozen=True)
+class Charge:
+    amount: Decimal = Decimal(0)
+    complete: bool = True
+    reasons: tuple = ()
+
+
+def charge(event: Event, prices: dict, session_long: bool = False) -> Charge:
+    price = prices.get(canonical_model(event.model))
+    if price is None:
+        return Charge(complete=False, reasons=("unknown_model",))
+    usage = event.usage
+    reasons = []
+    long = session_long or bool(price.long_threshold and event.request_input is not None and event.request_input > price.long_threshold)
+    if price.long_threshold and event.request_input is None and usage.input_tokens > price.long_threshold and not long:
+        reasons.append("unknown_request_size")
+    if usage.cache_write_input_tokens and price.write is None:
+        reasons.append("unknown_cache_write_price")
+    input_cost = usage.uncached * price.input + usage.cached_input_tokens * price.cached
+    if price.write is not None:
+        input_cost += usage.cache_write_input_tokens * price.write
+    amount = (input_cost * (2 if long else 1) + usage.output_tokens * price.output * (Decimal("1.5") if long else 1)) / 1000000
+    return Charge(amount, not reasons, tuple(reasons))
+
+
+@dataclass
+class Bucket:
+    usage: Usage = field(default_factory=Usage)
+    amount: Decimal = Decimal(0)
+    unpriced: Usage = field(default_factory=Usage)
+    uncertain: Usage = field(default_factory=Usage)
+    unknown_models: set = field(default_factory=set)
+    reasons: Counter = field(default_factory=Counter)
+    sessions: set = field(default_factory=set)
+    events: int = 0
+    resets: int = 0
+
+    def add(self, event: Event, cost: Charge) -> None:
+        self.usage += event.usage
+        self.amount += cost.amount
+        self.events += 1
+        self.resets += int(event.reset)
+        self.sessions.add(event.session_id)
+        if "unknown_model" in cost.reasons:
+            self.unpriced += event.usage
+            self.unknown_models.add(event.model)
+        elif not cost.complete:
+            self.uncertain += event.usage
+        self.reasons.update(cost.reasons)
+
+    def export(self) -> dict:
+        amount = float(round(self.amount, 8))
+        return {"usage": asdict(self.usage), "known_api_cost_usd": amount,
+                "api_cost_usd": None if self.reasons else amount,
+                "estimate_is_partial": bool(self.reasons), "unpriced_usage": asdict(self.unpriced),
+                "uncertain_pricing_usage": asdict(self.uncertain), "unpriced_models": sorted(self.unknown_models),
+                "pricing_issues": dict(self.reasons), "sessions": len(self.sessions),
+                "token_events": self.events, "counter_resets": self.resets,
+                "ratios": {"cached_input_of_input": self.usage.cached_input_tokens / self.usage.input_tokens if self.usage.input_tokens else None}}
+
+
+def group_day(day: str, by: str) -> str:
+    if day == "unknown" or by == "day":
+        return day
+    parsed = date.fromisoformat(day)
+    return day[:7] if by == "month" else (parsed - timedelta(days=parsed.weekday())).isoformat()
+
+
+def included(at: Optional[datetime], start: Optional[datetime], end: Optional[datetime]) -> bool:
+    if at is None:
+        return start is None and end is None
+    return (start is None or at >= start) and (end is None or at < end)
+
+
+def priced_events(sessions: list, prices: dict) -> list:
+    rows = []
+    for session in sessions:
+        long_models = set()
+        uncertain_models = set()
+        for event in session.events:
+            model = canonical_model(event.model)
+            price = prices.get(model)
+            if not price or price.long_scope != "session" or not price.long_threshold:
+                continue
+            if event.request_input is not None and event.request_input > price.long_threshold:
+                long_models.add(model)
+            elif event.request_input is None and event.usage.input_tokens > price.long_threshold:
+                uncertain_models.add(model)
+        for event in session.events:
+            model = canonical_model(event.model)
+            cost = charge(event, prices, model in long_models)
+            if model in uncertain_models and model not in long_models:
+                cost = replace(cost, complete=False, reasons=tuple(sorted(set(cost.reasons) | {"unknown_session_context"})))
+            rows.append((event, cost))
+    return rows
+
+
+def aggregate(rows: list, sessions: list, calendar: Calendar, start: Optional[datetime], end: Optional[datetime], by: str) -> dict:
+    total = Bucket()
+    models, days, groups, session_buckets = (defaultdict(Bucket) for _ in range(4))
+    bounds = {}
+    undated = 0
+    for event, cost in rows:
+        if not included(event.at, start, end):
+            undated += int(event.at is None)
+            continue
+        day = calendar.day(event.at)
+        total.add(event, cost)
+        models[event.model].add(event, cost)
+        days[day].add(event, cost)
+        session_buckets[event.session_id].add(event, cost)
+        if by in ("day", "week", "month"):
+            groups[group_day(day, by)].add(event, cost)
+        if event.at:
+            old = bounds.setdefault(event.session_id, [event.at, event.at])
+            old[0], old[1] = min(old[0], event.at), max(old[1], event.at)
+    details = []
+    for session in sessions:
+        if session.session_id not in session_buckets:
+            continue
+        times = bounds.get(session.session_id, [None, None])
+        details.append({**session_buckets[session.session_id].export(), "session_id": session.session_id,
+                        "parent_session_id": session.parent_id, "source_files": session.paths,
+                        "created_at": session.created_at.isoformat() if session.created_at else None,
+                        "started_at": times[0].isoformat() if times[0] else None,
+                        "ended_at": times[1].isoformat() if times[1] else None,
+                        "context_windows": sorted(session.context_windows)})
+    return {**total.export(), "by_model": {k: asdict(v.usage) for k, v in sorted(models.items())},
+            "by_model_detail": {k: v.export() for k, v in sorted(models.items())},
+            "by_day": {k: v.export() for k, v in sorted(days.items())}, "by_session": details,
+            "group_by": by, "groups": {k: v.export() for k, v in sorted(groups.items())},
+            "undated_events_excluded": undated}
+
+
+def normalize_window(raw: Any) -> Optional[dict]:
+    if not isinstance(raw, dict):
+        return None
+    used = finite(first(raw, "usedPercent", "used_percent"))
+    minutes = finite(first(raw, "windowDurationMins", "window_minutes"))
+    reset = finite(first(raw, "resetsAt", "resets_at"))
+    try:
+        reset_dt = datetime.fromtimestamp(reset, UTC) if reset is not None and reset > 0 else None
+    except (OverflowError, OSError, ValueError):
+        reset_dt = None
+    if used is None and minutes is None and reset_dt is None:
+        return None
+    return {"used_percent": used, "remaining_percent": max(0, min(100, 100 - used)) if used is not None else None,
+            "window_minutes": int(minutes) if minutes is not None and 0 < minutes <= 5256000 else None,
+            "resets_at": int(reset_dt.timestamp()) if reset_dt else None,
+            "resets_at_utc": reset_dt.isoformat() if reset_dt else None}
+
+
+def normalize_bucket(raw: Any, default_id: str = "unknown") -> Optional[dict]:
+    if not isinstance(raw, dict):
+        return None
+    bid = first(raw, "limitId", "limit_id") or default_id
+    if not isinstance(bid, str):
+        bid = default_id
+    credits_raw = raw.get("credits")
+    credits = None
+    if isinstance(credits_raw, dict):
+        balance = credits_raw.get("balance")
+        credits = {"has_credits": first(credits_raw, "hasCredits", "has_credits"),
+                   "unlimited": credits_raw.get("unlimited"),
+                   "balance": str(balance) if balance is not None else None}
+    return {"limit_id": bid, "limit_name": first(raw, "limitName", "limit_name"),
+            "plan_type": first(raw, "planType", "plan_type"),
+            "credits": credits,
+            "primary": normalize_window(raw.get("primary")),
+            "secondary": normalize_window(raw.get("secondary")),
+            "individual_limit": normalize_window(first(raw, "individualLimit", "individual_limit"))}
+
+
+def normalize_live(raw: Any, now: datetime) -> Optional[dict]:
+    if not isinstance(raw, dict):
+        return None
+    buckets = {}
+    by_id = first(raw, "rateLimitsByLimitId", "rate_limits_by_limit_id")
+    if isinstance(by_id, dict):
+        for key, value in by_id.items():
+            bucket = normalize_bucket(value, str(key))
+            if bucket:
+                buckets[bucket["limit_id"]] = bucket
+    single = normalize_bucket(first(raw, "rateLimits", "rate_limits"), "codex")
+    if single:
+        buckets.setdefault(single["limit_id"], single)
+    if not buckets:
+        return None
+    reset = first(raw, "rateLimitResetCredits", "rate_limit_reset_credits")
+    credits = finite(first(reset, "availableCount", "available_count")) if isinstance(reset, dict) else None
+    return {"source": "app_server", "fetched_at": now.isoformat(), "limits": buckets,
+            "rate_limit_reset_credits": {"available_count": int(credits)} if credits is not None else None}
+
+
+def find_codex(explicit: Optional[str] = None) -> Optional[str]:
+    candidates = [explicit] if explicit else [os.environ.get("CODEX_CLI_PATH"), shutil.which("codex"),
+        "/Applications/Codex.app/Contents/Resources/codex", "/Applications/ChatGPT.app/Contents/Resources/codex"]
+    for candidate in candidates:
+        if candidate:
+            path = Path(candidate).expanduser()
+            if path.is_file() and os.access(path, os.X_OK):
+                return str(path)
+    return None
+
+
+def fetch_live(binary: Optional[str], timeout: float, cancel: Optional[threading.Event] = None) -> tuple:
+    """One bounded, cancellable JSON-RPC request. Never changes quota/credits."""
+    executable = find_codex(binary)
+    if not executable:
+        return None, "Codex not found; specify --codex-binary or use --quota logs"
+    process = None
+    selector = selectors.DefaultSelector()
+    deadline = time.monotonic() + timeout
+    buffer = bytearray()
+    try:
+        process = subprocess.Popen([executable, "app-server", "--listen", "stdio://"],
+                                   stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                                   bufsize=0)
+        selector.register(process.stdout, selectors.EVENT_READ)
+
+        def send(method: str, params: dict, request_id: Optional[int] = None) -> None:
+            message = {"method": method, "params": params}
+            if request_id is not None:
+                message["id"] = request_id
+            process.stdin.write((json.dumps(message) + "\n").encode())
+            process.stdin.flush()
+
+        def receive(request_id: int) -> dict:
+            while True:
+                if cancel and cancel.is_set():
+                    raise InterruptedError("Query cancelled")
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError(f"Quota query exceeded {timeout:g} seconds")
+                while b"\n" in buffer:
+                    line, _, rest = buffer.partition(b"\n")
+                    buffer[:] = rest
+                    try:
+                        message = json.loads(line)
+                    except (ValueError, UnicodeDecodeError):
+                        continue
+                    if isinstance(message, dict) and message.get("id") == request_id:
+                        if "error" in message:
+                            raise RuntimeError("Codex App Server rejected the quota request; check your login")
+                        return message
+                if not selector.select(min(remaining, .1)):
+                    continue
+                chunk = os.read(process.stdout.fileno(), 65536)
+                if not chunk:
+                    raise RuntimeError("Codex App Server exited before responding")
+                buffer.extend(chunk)
+                if len(buffer) > 8 * 1024 * 1024:
+                    raise RuntimeError("Codex App Server response is too large")
+
+        send("initialize", {"clientInfo": {"name": "oai-usage", "title": "OAI Usage", "version": VERSION}, "capabilities": {}}, 0)
+        receive(0)
+        send("initialized", {})
+        send("account/rateLimits/read", {}, 1)
+        result = normalize_live(receive(1).get("result"), datetime.now(UTC))
+        return (result, None) if result else (None, "Codex returned no recognizable account quota")
+    except (OSError, RuntimeError, TimeoutError, ValueError) as exc:
+        return None, str(exc)
+    finally:
+        selector.close()
+        if process:
+            if process.poll() is None:
+                process.terminate()
+                try:
+                    process.wait(timeout=.5)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                    process.wait(timeout=1)
+            for stream in (process.stdin, process.stdout):
+                if stream:
+                    stream.close()
+
+
+class QuotaPoller:
+    def __init__(self, binary: Optional[str], timeout: float, interval: float) -> None:
+        self.binary, self.timeout, self.interval = binary, timeout, interval
+        self.cancel = threading.Event()
+        self.lock = threading.Lock()
+        self.result = None
+        self.error = "Fetching live quota"
+        self.thread = threading.Thread(target=self._run, name="oai-usage-quota", daemon=True)
+
+    def start(self) -> None:
+        self.thread.start()
+
+    def _run(self) -> None:
+        while not self.cancel.is_set():
+            result, error = fetch_live(self.binary, self.timeout, self.cancel)
+            with self.lock:
+                self.result, self.error = result, error
+            self.cancel.wait(self.interval)
+
+    def read(self) -> tuple:
+        with self.lock:
+            return copy.deepcopy(self.result), self.error
+
+    def stop(self) -> None:
+        self.cancel.set()
+        self.thread.join(timeout=2)
+
+
+def log_limits(rollouts: list) -> Optional[dict]:
+    buckets = {}
+    for rollout in rollouts:
+        for bid, bucket in rollout.limits.items():
+            if bid not in buckets or timestamp(bucket["observed_at"]) > timestamp(buckets[bid]["observed_at"]):
+                buckets[bid] = copy.deepcopy(bucket)
+    return {"source": "session_log", "limits": buckets} if buckets else None
+
+
+def quota_status(mode: str, rollouts: list, live: tuple, now: datetime, limit_id: Optional[str]) -> Optional[dict]:
+    if mode == "off":
+        return None
+    current, error = live
+    if mode == "logs" or (mode == "auto" and not current):
+        current = log_limits(rollouts)
+        if current and mode == "auto" and error:
+            current["fallback_reason"] = error
+    if not current:
+        return {"source": "unavailable", "error": "No quota snapshot in the logs" if mode == "logs" else error or "Quota unavailable"}
+    current = copy.deepcopy(current)
+    buckets = current["limits"]
+    chosen = limit_id or ("codex" if "codex" in buckets else next(iter(sorted(buckets))))
+    current["active_limit_id"] = chosen
+    for bucket in buckets.values():
+        observed = timestamp(bucket.get("observed_at") or current.get("fetched_at"))
+        bucket["snapshot_age_seconds"] = max(0, int((now - observed).total_seconds())) if observed else None
+        for key in ("primary", "secondary", "individual_limit"):
+            window = bucket.get(key)
+            if window:
+                reset = timestamp(window.get("resets_at_utc"))
+                window["expired"] = bool(reset and now >= reset)
+    if chosen not in buckets:
+        current["error"] = f"Quota bucket {chosen} was not returned; available: {', '.join(sorted(buckets))}"
+    return current
+
+
+def projections(rows: list, current: Optional[dict], now: datetime) -> dict:
+    result = {}
+    if not current or current.get("source") == "unavailable":
+        return result
+    bid = current.get("active_limit_id")
+    bucket = current.get("limits", {}).get(bid)
+    if not bucket:
+        return result
+    observed = timestamp(bucket.get("observed_at") or current.get("fetched_at"))
+    for kind in ("primary", "secondary", "individual_limit"):
+        window = bucket.get(kind)
+        if not window:
+            continue
+        value = {"available": False, "projection_available": False, "reason": None,
+                 "limit_id": bid, "window_kind": kind}
+        result[kind] = value
+        reset = timestamp(window.get("resets_at_utc"))
+        minutes = window.get("window_minutes")
+        used = window.get("used_percent")
+        if bid not in ("codex", "unknown"):
+            value["reason"] = "Logs do not identify which models belong to this quota bucket"
+            continue
+        if not reset or not minutes or not observed:
+            value["reason"] = "Quota snapshot is missing the window or observation time"
+            continue
+        # Recompute from the latest server window on every report/watch frame.
+        # Manual resets may move this boundary before the previous cycle ends.
+        start = reset - timedelta(minutes=minutes)
+        if not start <= now < reset:
+            value["reason"] = "Quota window has expired or has not started"
+            continue
+        if not start <= observed < reset or observed > now + timedelta(seconds=5):
+            value["reason"] = "Snapshot time is outside the current cycle"
+            continue
+        as_of = min(observed, now)
+        local = Bucket()
+        for event, cost in rows:
+            if event.at and start <= event.at <= as_of:
+                local.add(event, cost)
+        value.update(available=True, local=local.export(), period={"start": start.isoformat(),
+                     "as_of": as_of.isoformat(), "resets_at": reset.isoformat(), "window_minutes": minutes},
+                     account_usage={"used_percent": used, "remaining_percent": window.get("remaining_percent")},
+                     projection_kind="local_machine_standard_api_equivalent_heuristic")
+        if used is None or not 0 < used <= 100 or local.amount <= 0:
+            value["reason"] = "A positive used percentage and local cost are required for projection"
+            continue
+        total = local.amount / (Decimal(str(used)) / 100)
+        remaining = max(Decimal(0), total - local.amount)
+        value.update(projection_available=True, estimate_is_partial=bool(local.reasons),
+                     projected_full_cycle_known_api_cost_usd=float(round(total, 8)),
+                     projected_remaining_known_api_cost_usd=float(round(remaining, 8)),
+                     projected_full_cycle_api_cost_usd=None if local.reasons else float(round(total, 8)),
+                     projected_remaining_api_cost_usd=None if local.reasons else float(round(remaining, 8)))
+    return result
+
+
+ISSUES = {
+    "missing_roots": "Scan directory does not exist", "unreadable_roots": "Unreadable directories",
+    "unreadable_files": "Unreadable files", "malformed_json_lines": "Malformed JSON lines skipped",
+    "invalid_usage_snapshots": "Invalid usage snapshots skipped", "pending_partial_line": "Incomplete log lines pending",
+    "counter_component_corrections": "Counter component corrections detected",
+    "unattributed_fork_baseline_tokens": "Unattributed fork baseline tokens excluded",
+    "inherited_baseline_tokens_excluded": "Inherited cumulative baseline tokens excluded",
+    "inherited_snapshots_excluded": "Inherited snapshots excluded", "duplicate_snapshots_removed": "Duplicate snapshots removed",
+    "events_without_request_detail": "Events without per-request details",
+    "conflicting_request_metadata": "Conflicting request details in duplicate snapshots",
+    "conflicting_model_metadata": "Conflicting model identities in duplicate snapshots",
+    "request_detail_exceeds_delta": "Request details disagree with cumulative delta; cumulative delta used",
+}
+
+
+def bounds(args: argparse.Namespace, calendar: Calendar, now: datetime) -> tuple:
+    if args.today:
+        start = calendar.midnight(calendar.local(now).date())
+    elif args.since:
+        start = calendar.midnight(date.fromisoformat(args.since))
+    else:
+        start = now - timedelta(days=args.days) if args.days else None
+    end = calendar.midnight(date.fromisoformat(args.until) + timedelta(days=1)) if args.until else now
+    if start and start >= end:
+        raise ValueError("Start must precede end; use both --since and --until for historical reports")
+    return start, end
+
+
+@dataclass
+class ReportCache:
+    revision: int = -1
+    sessions: list = field(default_factory=list)
+    issues: Counter = field(default_factory=Counter)
+    rows: list = field(default_factory=list)
+    times: list = field(default_factory=list)
+    summary_key: tuple = ()
+    summary: dict = field(default_factory=dict)
+
+    def prepare(self, scanner: Scanner, rollouts: list, prices: dict) -> None:
+        if self.revision != scanner.revision:
+            self.sessions, self.issues = account(rollouts)
+            self.rows = priced_events(self.sessions, prices)
+            self.times = sorted(e.at for e, _ in self.rows if e.at is not None)
+            self.revision = scanner.revision
+            self.summary_key = ()
+
+    def summarize(self, calendar: Calendar, start: Optional[datetime], end: Optional[datetime], by: str) -> dict:
+        # A sliding time window needs recomputing only when it crosses an event.
+        lo = bisect_left(self.times, start) if start else 0
+        hi = bisect_left(self.times, end) if end else len(self.times)
+        key = (self.revision, calendar.name, lo, hi, start is None and end is None, by)
+        if key != self.summary_key:
+            self.summary = aggregate(self.rows, self.sessions, calendar, start, end, by)
+            self.summary_key = key
+        return copy.deepcopy(self.summary)
+
+
+def report(args: argparse.Namespace, scanner: Scanner, prices: dict, calendar: Calendar,
+           roots: list, poller: Optional[QuotaPoller] = None, cache: Optional[ReportCache] = None) -> dict:
+    # For a one-shot live query, scan AFTER observing quota so the log cutoff can
+    # include tokens already reflected in that quota snapshot.
+    live = (None, None)
+    if args.quota in ("auto", "live"):
+        live = poller.read() if poller else fetch_live(args.codex_binary, args.timeout)
+    rollouts = scanner.scan(roots)
+    now = datetime.now(UTC)
+    cache = cache or ReportCache()
+    cache.prepare(scanner, rollouts, prices)
+    sessions, rows = cache.sessions, cache.rows
+    issues = cache.issues.copy()
+    issues.update(scanner.issues)
+    start, end = bounds(args, calendar, now)
+    summary = cache.summarize(calendar, start, end, args.by)
+    current = quota_status(args.quota, rollouts, live, now, args.limit_id)
+    summary["current_rate_limits"] = current
+    summary["cycle_estimates"] = projections(rows, current, now)
+    return {"schema_version": 2, "version": VERSION, "generated_at": now.isoformat(),
+            "period": {"start": start.isoformat() if start else None, "end": end.isoformat() if end else None,
+                       "timezone": calendar.name, "end_exclusive": True},
+            "roots": [str(p) for p in roots],
+            "projection_assumptions": ["Account usage primarily occurs on this machine", "Quota consumption is approximately proportional to local API-equivalent cost",
+                "Future model and cache mix remains similar", "Account percentages may be rounded", "Account ownership of log snapshots cannot be independently verified"],
+            "pricing": {"basis": "standard_api_equivalent",
+                "verified_at": PRICE_DATE, "historical_price_schedule": False,
+                "excluded": ["tools", "regional_uplift", "fast_or_priority_service", "subscription_billing"],
+                "models": {k: {"input": str(p.input), "cached_input": str(p.cached), "output": str(p.output),
+                    "cache_write": str(p.write) if p.write is not None else None,
+                    "long_context_threshold": p.long_threshold, "long_context_scope": p.long_scope, "source": p.source}
+                    for k, p in sorted(prices.items())}},
+            "diagnostics": {"files": len(rollouts), "issues": dict(sorted(issues.items())),
+                            "bytes_read_this_process": scanner.bytes_read},
+            "summary": summary, "sessions": summary["by_session"]}
+
+
+def safe_text(value: Any) -> str:
+    # Logs and model names can contain terminal control sequences.
+    return "".join(c for c in str(value) if not unicodedata.category(c).startswith("C"))
+
+
+def width(value: str) -> int:
+    return sum(0 if unicodedata.combining(c) else 2 if unicodedata.east_asian_width(c) in ("W", "F") else 1 for c in value)
+
+
+def fit(value: Any, limit: int) -> str:
+    text = safe_text(value)
+    if width(text) <= limit:
+        return text
+    out = ""
+    for c in text:
+        if width(out + c) > limit - 1:
+            return out + "…"
+        out += c
+    return out
+
+
+def money(row: dict) -> str:
+    value = row.get("api_cost_usd")
+    if value is not None:
+        return f"${value:,.4f}"
+    known = row.get("known_api_cost_usd", 0)
+    return f"${known:,.4f} + unknown" if known else "unknown"
+
+
+def table(headers: list, rows: list, terminal_width: int = 120) -> list:
+    if not rows:
+        return ["  No records"]
+    first_width = max(12, min(40, terminal_width - 56))
+    limits = [first_width] + [18] * (len(headers) - 1)
+    clean = [[fit(v, limits[i]) for i, v in enumerate(row)] for row in [headers] + rows]
+    widths = [max(width(row[i]) for row in clean) for i in range(len(headers))]
+    lines = []
+    for index, row in enumerate(clean):
+        cells = [(v + " " * (widths[i] - width(v))) if i == 0 else (" " * (widths[i] - width(v)) + v) for i, v in enumerate(row)]
+        lines.append("  " + "  ".join(cells))
+        if index == 0:
+            lines.append("  " + "  ".join("─" * n for n in widths))
+    return lines
+
+
+def percentage(part: int, whole: int) -> str:
+    return f"{part / whole:.1%}" if whole else "-"
+
+
+def wrap_cells(value: str, limit: int) -> list:
+    text = safe_text(value)
+    rows = []
+    while width(text) > limit:
+        end, cells = 0, 0
+        for char in text:
+            if cells + width(char) > limit:
+                break
+            end += 1
+            cells += width(char)
+        split = text.rfind(" ", 0, end + 1)
+        cut = split if split > 0 else max(1, end)
+        rows.append(text[:cut].rstrip())
+        text = text[cut:].lstrip()
+    return rows + [text]
+
+
+def panel(title: str, rows: list, columns: int, wrap: bool = True) -> list:
+    columns = max(8, columns)
+    inner = columns - 4
+    heading = fit(title, inner)
+    top = "╭─ " + heading + " " + "─" * max(0, columns - width(heading) - 5) + "╮"
+    body = []
+    for raw in rows:
+        for row in wrap_cells(raw, inner) if wrap else [fit(raw, inner)]:
+            body.append("│ " + row + " " * (inner - width(row)) + " │")
+    return [top, *body, "╰" + "─" * (columns - 2) + "╯"]
+
+
+def side_by_side(cards: list, columns: int) -> list:
+    left, right = cards
+    left_width = width(left[0])
+    lines = []
+    for i in range(max(len(left), len(right))):
+        a = left[i] if i < len(left) else " " * left_width
+        b = right[i] if i < len(right) else ""
+        lines.append(fit(a + "  " + b, columns))
+    return lines
+
+
+def progress(used: Optional[float], columns: int) -> str:
+    if used is None:
+        return "Quota usage unavailable"
+    remaining = max(0, min(100, 100 - used))
+    bar_width = max(4, min(30, columns - 35))
+    filled = round(bar_width * max(0, min(100, used)) / 100)
+    return "█" * filled + "░" * (bar_width - filled) + f"  {used:g}% used · {remaining:g}% left"
+
+
+def cycle_card(kind: str, estimate: dict, calendar: Calendar, columns: int, compact: bool, multiple: bool) -> list:
+    title = "Current cycle" + (" · " + kind.replace("_", " ").title() if multiple else "")
+    if not estimate["available"]:
+        return panel(title, ["Unavailable", estimate.get("reason") or "Insufficient data"], columns, wrap=not compact)
+    period, account, local = estimate["period"], estimate["account_usage"], estimate["local"]
+    usage = local["usage"]
+    partial = local["estimate_is_partial"]
+    if partial:
+        title += " · PARTIAL"
+    body = [progress(account.get("used_percent"), columns - 4)]
+    local_cost = f"${local['known_api_cost_usd']:,.6f}" + (" + unknown" if partial else "")
+    total = f"~${estimate['projected_full_cycle_known_api_cost_usd']:,.4f}" if estimate["projection_available"] else "unavailable"
+    remaining = f"~${estimate['projected_remaining_known_api_cost_usd']:,.4f}" if estimate["projection_available"] else "unavailable"
+    if columns >= 90:
+        cell = (columns - 8) // 3
+        labels = ("LOCAL API COST", "EST. TOTAL", "EST. REMAINING")
+        values = (local_cost, total, remaining)
+        body += ["", "  ".join(s.ljust(cell) for s in labels),
+                 "  ".join(fit(s, cell).ljust(cell) for s in values), ""]
+    else:
+        body += [f"Local Cost Used: {local_cost}", f"Est. Total: {total}", f"Est. Remaining: {remaining}"]
+    # Actual dates identify the cycle. Its length can change or be reset early.
+    display = (lambda v: calendar.local(timestamp(v)).strftime("%m-%d %H:%M")) if compact else (lambda v: calendar.display(timestamp(v)))
+    if compact:
+        body.append(f"{display(period['start'])} → {display(period['resets_at'])}")
+        body.append(f"As of {display(period['as_of'])} · {usage['total_tokens']:,} tokens")
+    else:
+        body += ["Started  " + display(period["start"]), "Resets   " + display(period["resets_at"]),
+                 "As of    " + display(period["as_of"]), "",
+                 f"Tokens: {usage['total_tokens']:,} total · {usage['input_tokens']:,} in · {usage['cached_input_tokens']:,} cached · {usage['output_tokens']:,} out",
+                 f"Cache write: {usage['cache_write_input_tokens']:,} · Reasoning: {usage['reasoning_output_tokens']:,}",
+                 f"Sessions: {local['sessions']:,} · Events: {local['token_events']:,}"]
+        missing = local["unpriced_usage"]["total_tokens"] + local["uncertain_pricing_usage"]["total_tokens"]
+        body.append(f"Fully priced tokens: {percentage(usage['total_tokens'] - missing, usage['total_tokens'])}")
+    if not estimate["projection_available"] and not compact:
+        body.append("Projection unavailable: " + (estimate.get("reason") or "Insufficient data"))
+    return panel(title, body, columns, wrap=not compact)
+
+
+def cycle_lines(estimates: dict, calendar: Calendar, compact: bool = False, columns: int = 120) -> list:
+    items = list(estimates.items())
+    lines = []
+    # Paired cards keep every cycle's money visible in a standard watch screen.
+    if compact and len(items) == 2 and columns >= 96:
+        size = (columns - 2) // 2
+        cards = [cycle_card(kind, value, calendar, size, True, True) for kind, value in items]
+        return side_by_side(cards, columns)
+    for kind, value in items:
+        if lines:
+            lines.append("")
+        lines += cycle_card(kind, value, calendar, columns, compact, len(items) > 1)
+    return lines
+
+
+def style_line(line: str) -> str:
+    """Add trusted ANSI styles only after all layout and clipping is complete."""
+    if "OAI USAGE" in line:
+        return "\033[1;36m" + line + "\033[0m"
+    if line.startswith("Report: "):
+        return "\033[2m" + line + "\033[0m"
+    if line.startswith(("╭", "╰", "├")):
+        return "\033[36m" + line + "\033[0m"
+    if "LOCAL API COST" in line:
+        return "\033[2m" + line.replace("│", "\033[36m│\033[0;2m") + "\033[0m"
+    def color_bar(match: re.Match) -> str:
+        bar, gap, used_text = match.group(1, 2, 3)
+        used = float(used_text)
+        color = "31" if used >= 85 else "33" if used >= 60 else "32"
+        bar = re.sub(r"█+", lambda m: f"\033[{color}m{m[0]}\033[0m", bar)
+        bar = re.sub(r"░+", lambda m: f"\033[2m{m[0]}\033[0m", bar)
+        return bar + gap + used_text + "% used"
+    line = re.sub(r"([█░]+)( +)([-\d.]+)% used", color_bar, line)
+    line = re.sub(r"~?\$[\d,]+(?:\.\d+)?", lambda m: f"\033[1;32m{m[0]}\033[0m", line)
+    line = re.sub(r"\b(?:unknown|unavailable|PARTIAL|expired)\b", lambda m: f"\033[33m{m[0]}\033[0m", line)
+    return line.replace("│", "\033[36m│\033[0m")
+
+
+def render(data: dict, args: argparse.Namespace, calendar: Calendar, columns: int = 120) -> str:
+    columns = max(8, min(columns, 140))
+    compact = args.command == "watch"
+    summary, period = data["summary"], data["period"]
+    usage = summary["usage"]
+    current = summary["current_rate_limits"]
+    source = {"app_server": "LIVE", "session_log": "LOG SNAPSHOT", "unavailable": "QUOTA UNAVAILABLE"}.get(
+        current.get("source") if current else None, "LOCAL LOGS")
+    lines = [f"OAI USAGE  {VERSION}   /   USAGE & QUOTA",
+             f"Report: {calendar.display(timestamp(period['start']))} → {calendar.display(timestamp(period['end']))} · {source}"]
+    if args.project and current:
+        estimates = summary["cycle_estimates"]
+        if estimates:
+            lines += cycle_lines(estimates, calendar, compact, columns)
+        else:
+            lines += panel("Current cycle", ["Unavailable: " + (current.get("error") or "No quota windows available")], columns)
+        lines.append("")
+
+    report_rows = [f"API cost  {money(summary)}   ·   {usage['total_tokens']:,} tokens   ·   {summary['sessions']:,} sessions",
+                   f"Input {usage['input_tokens']:,}  ·  Cached {usage['cached_input_tokens']:,}  ·  Output {usage['output_tokens']:,}"]
+    if not compact:
+        report_rows += [f"Cache write {usage['cache_write_input_tokens']:,}  ·  Reasoning {usage['reasoning_output_tokens']:,}  ·  Events {summary['token_events']:,}",
+                        f"Cached/In {percentage(usage['cached_input_tokens'], usage['input_tokens'])}  ·  Out/Total {percentage(usage['output_tokens'], usage['total_tokens'])}",
+                        f"From {calendar.display(timestamp(period['start']))} to {calendar.display(timestamp(period['end']))}"]
+    lines += panel("Selected report period", report_rows, columns, wrap=not compact)
+
+    # Compact watch already has the quota bar and dates inside each cycle card.
+    if current and (not compact or not args.project):
+        quota_rows = []
+        if current.get("source") == "unavailable" or current.get("error"):
+            quota_rows.append(current.get("error", "Unavailable"))
+        else:
+            bid = current["active_limit_id"]
+            bucket = current["limits"][bid]
+            label = "LIVE" if current["source"] == "app_server" else "LOG SNAPSHOT"
+            age = bucket.get("snapshot_age_seconds")
+            age_label = f"{age}s ago" if age is not None else "time unknown"
+            quota_rows.append(f"{label} · {safe_text(bid)} · {safe_text(bucket.get('plan_type') or 'plan unknown')} · {age_label}")
+            for kind in ("primary", "secondary", "individual_limit"):
+                window = bucket.get(kind)
+                if window:
+                    stale = " [expired]" if window.get("expired") else ""
+                    quota_rows.append(f"{kind.replace('_', ' ').title()}: {progress(window.get('used_percent'), columns - 20)}{stale}")
+                    quota_rows.append("Resets " + calendar.display(timestamp(window.get("resets_at_utc"))))
+            if len(current["limits"]) > 1:
+                quota_rows.append("Other buckets: " + ", ".join(safe_text(k) for k in sorted(current["limits"]) if k != bid) + " (--limit)")
+            if current.get("fallback_reason"):
+                quota_rows.append("Fallback: " + safe_text(current["fallback_reason"]))
+            credits = bucket.get("credits")
+            if credits:
+                balance = safe_text(credits.get("balance") if credits.get("balance") is not None else "unknown")
+                quota_rows.append(f"Credits: {'unlimited' if credits.get('unlimited') else balance}")
+            reset_credits = current.get("rate_limit_reset_credits")
+            if reset_credits:
+                quota_rows.append(f"Reset credits available: {reset_credits['available_count']}")
+        lines += ["", *panel("Account quota", quota_rows, columns)]
+
+    dimensions = ["model", "day", "session"] if args.all_dimensions else [args.by]
+    for by in dimensions:
+        if by == "model":
+            entries = list(summary["by_model_detail"].items())
+            title = "By model"
+        elif by == "session":
+            entries = [(r["session_id"], r) for r in summary["by_session"]]
+            title = "By session (including independent subtasks)"
+        else:
+            entries = list((summary["by_day"] if by == "day" else summary["groups"]).items())
+            title = {"day": "By day", "week": "By week", "month": "By month"}[by]
+        entries.sort(key=(lambda row: (-row[1]["usage"]["total_tokens"], row[0])) if by in ("model", "session") else (lambda row: row[0]),
+                     reverse=by not in ("model", "session"))
+        shown = entries[:args.top] if args.top else entries
+        lines += ["", title, "─" * columns]
+        if columns >= 120:
+            rows = []
+            for key, row in shown:
+                tokens = row["usage"]
+                rows.append((key, f"{tokens['input_tokens']:,}", f"{tokens['cached_input_tokens']:,}",
+                             f"{tokens['output_tokens']:,}", f"{tokens['reasoning_output_tokens']:,}",
+                             percentage(tokens['cached_input_tokens'], tokens['input_tokens']),
+                             percentage(tokens['output_tokens'], tokens['total_tokens']), money(row)))
+            lines += table(["Name", "Input", "Cached", "Output", "Reasoning", "Cached/In", "Out/Total", "API Cost"], rows, columns)
+        else:
+            for key, row in shown:
+                tokens = row["usage"]
+                lines.append(f"  {safe_text(key)}  ·  {money(row)}")
+                lines.append(f"  In {tokens['input_tokens']:,} · Cached {tokens['cached_input_tokens']:,} · Out {tokens['output_tokens']:,}")
+                if not compact:
+                    lines.append(f"  Reasoning {tokens['reasoning_output_tokens']:,} · Cached/In {percentage(tokens['cached_input_tokens'], tokens['input_tokens'])} · Out/Total {percentage(tokens['output_tokens'], tokens['total_tokens'])}")
+            if not shown:
+                lines.append("  No records")
+        if len(shown) < len(entries):
+            lines.append(f"Showing {len(shown)}/{len(entries)} entries; --top 0 shows all. JSON is always complete.")
+    issues = data["diagnostics"]["issues"]
+    warnings = [(ISSUES.get(k, k), v) for k, v in issues.items() if v and k not in (
+        "inherited_snapshots_excluded", "duplicate_snapshots_removed", "events_without_request_detail", "inherited_baseline_tokens_excluded")]
+    if summary["unpriced_models"]:
+        warnings.append(("Unpriced models", ", ".join(safe_text(v) for v in summary["unpriced_models"])))
+    if summary["undated_events_excluded"]:
+        warnings.append(("Undated events excluded", summary["undated_events_excluded"]))
+    if warnings:
+        lines += ["", *panel("Data notes", [f"{label}: {value}" for label, value in warnings], columns)]
+    lines += ["", "Standard API equivalent · not a subscription bill · tools/Fast/regional charges excluded."]
+    if args.project and current:
+        lines.append("Estimates = local cycle cost / account usage fraction; assume usage primarily on this machine.")
+    if not summary["token_events"]:
+        lines.append("No usage in this report period; try --days all or --root to select log directories.")
+    return "\n".join(fit(line, columns) for line in lines)
+
+
+def write_json(path: Path, data: dict, protected: set) -> None:
+    path = path.expanduser()
+    if path.resolve() in protected or path.suffix.lower() == ".jsonl":
+        raise ValueError("Output cannot overwrite the program or session JSONL logs; choose a separate .json file")
+    encoded = json.dumps(data, ensure_ascii=False, indent=2, allow_nan=False) + "\n"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    name = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", prefix=".oai-usage-", dir=path.parent, delete=False) as handle:
+            name = handle.name
+            handle.write(encoded)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(name, path)
+        name = None
+    finally:
+        if name:
+            Path(name).unlink(missing_ok=True)
+
+
+def positive(value: str) -> float:
+    number = finite(value)
+    if number is None or number <= 0 or number > 86400:
+        raise argparse.ArgumentTypeError("Enter a finite number greater than 0 and at most 86400")
+    return number
+
+
+def days_value(value: str) -> int:
+    if value.lower() == "all":
+        return 0
+    try:
+        number = int(value)
+        if not 0 <= number <= 365000:
+            raise ValueError()
+        return number
+    except ValueError:
+        raise argparse.ArgumentTypeError("Enter a nonnegative number of days, or all")
+
+
+def parse_args(argv: Optional[list] = None) -> argparse.Namespace:
+    args = list(sys.argv[1:] if argv is None else argv)
+    legacy_watch = any(v in ("-w", "--watch") for v in args)
+    if legacy_watch:
+        args = [v for v in args if v not in ("-w", "--watch")]
+    if not args or args[0] not in ("report", "watch", "prices", "-h", "--help", "--version"):
+        args.insert(0, "watch" if legacy_watch else "report")
+    parser = argparse.ArgumentParser(prog="oai-usage", description="Local Codex usage, API-equivalent costs, and account quotas",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""Examples:
+  oai-usage                         Last 30 days and current quota-cycle costs
+  oai-usage --today                  Today in the selected timezone
+  oai-usage watch                    Live dashboard; Ctrl+C to quit
+  oai-usage --days all --by session  All session details
+  oai-usage --by day --output report.json
+  oai-usage --quota off --json       Local-only JSON report
+  oai-usage report --help            All filter, pricing, and quota options""")
+    parser.add_argument("--version", action="version", version=f"oai-usage {VERSION}")
+    sub = parser.add_subparsers(dest="command", required=True)
+    for name, help_text in (("report", "Usage report (default)"), ("watch", "Continuously refresh usage")):
+        p = sub.add_parser(name, help=help_text, description=help_text)
+        dates = p.add_mutually_exclusive_group()
+        dates.add_argument("--days", type=days_value, default=30, metavar="N|all", help="Last N x 24 hours; all for all history (default: 30)")
+        dates.add_argument("--today", action="store_true", help="Today in the selected timezone")
+        dates.add_argument("--since", metavar="YYYY-MM-DD", help="Inclusive start date")
+        p.add_argument("--until", metavar="YYYY-MM-DD", help="Inclusive end date")
+        p.add_argument("--timezone", default="local", metavar="ZONE", help="Calendar timezone, e.g. UTC or America/New_York (default: system timezone)")
+        p.add_argument("--by", "--group-by", choices=("model", "day", "week", "month", "session"), default="model", help="Grouping (default: model)")
+        p.add_argument("--all", "--all-dimensions", dest="all_dimensions", action="store_true", help="Show model, day, and session details together")
+        p.add_argument("--top", type=int, default=15, help="Show N entries; 0 for all. JSON is never truncated (default: 15)")
+        p.add_argument("--root", action="append", help="Replace default log directories; repeatable. Defaults use CODEX_HOME or ~/.codex")
+        p.add_argument("--quota", "--limits-source", choices=("auto", "live", "logs", "off"), default="auto", help="Quota source (default: live with log fallback)")
+        p.add_argument("--limit", dest="limit_id", help="Select a quota bucket ID (default: prefer codex)")
+        projection = p.add_mutually_exclusive_group()
+        projection.add_argument("--project", dest="project", action="store_true", default=True, help="Show current-cycle costs and projections (default)")
+        projection.add_argument("--no-project", dest="project", action="store_false", help="Hide the current-cycle section in terminal output")
+        p.add_argument("--codex-binary", help="Path to the Codex executable")
+        p.add_argument("--timeout", "--limits-timeout", type=positive, default=10, help="Live quota timeout in seconds (default: 10)")
+        p.add_argument("--price", action="append", default=[], metavar="MODEL=IN,CACHED,OUT[,WRITE]", help="Custom USD rates per million tokens")
+        p.add_argument("--json", action="store_true", help="Only print JSON to stdout; watch emits one JSON document per line")
+        p.add_argument("--output", "--json-out", help="Atomically save the full JSON report; - for stdout")
+        color = p.add_mutually_exclusive_group()
+        color.add_argument("--no-color", action="store_true", help="Disable colors")
+        color.add_argument("--color", action="store_true", help="Enable title colors")
+        p.add_argument("--refresh", "--interval", "-n", type=positive, default=2, help="Watch refresh interval in seconds (default: 2)")
+        p.add_argument("--quota-interval", type=positive, default=30, help="Watch live quota polling interval in seconds (default: 30)")
+        p.add_argument("--count", type=int, default=0, help="Exit watch after N refreshes; 0 to keep running")
+    p = sub.add_parser("prices", help="Show built-in prices and official sources")
+    p.add_argument("--json", action="store_true")
+    parsed = parser.parse_args(args)
+    if parsed.command != "prices":
+        try:
+            if parsed.top < 0 or parsed.count < 0:
+                raise ValueError("--top and --count must be nonnegative")
+            if parsed.today and parsed.until:
+                raise ValueError("--today cannot be combined with --until")
+            calendar = Calendar.make(parsed.timezone)
+            bounds(parsed, calendar, datetime.now(UTC))
+            price_overrides(parsed.price)
+        except (ValueError, OverflowError, ZoneInfoNotFoundError) as exc:
+            parser.error(f"Invalid date, timezone, or price option: {exc}")
+    return parsed
+
+
+def main(argv: Optional[list] = None) -> int:
+    args = parse_args(argv)
+    if args.command == "prices":
+        rows = [{"model": model, "input": str(p.input), "cached": str(p.cached), "output": str(p.output),
+                 "cache_write": str(p.write) if p.write is not None else None, "source": p.source,
+                 "long_context_threshold": p.long_threshold, "long_context_scope": p.long_scope}
+                for model, p in default_prices().items()]
+        if args.json:
+            print(json.dumps({"verified_at": PRICE_DATE, "prices": rows}, ensure_ascii=False, indent=2))
+        else:
+            print(f"Standard API prices · USD / 1M tokens · Verified {PRICE_DATE}")
+            print("\n".join(table(["Model", "Input", "Cached", "Output", "Write"],
+                [[r['model'], r['input'], r['cached'], r['output'], r['cache_write'] or '-'] for r in rows])))
+            print("\nLong context above 272K: input/cache 2x, output 1.5x; 5.4/5.5 per session, others per request.")
+            for r in rows:
+                print(f"{r['model']}: {r['source']}")
+        return 0
+    calendar = Calendar.make(args.timezone)
+    prices = price_overrides(args.price)
+    codex_home = Path(os.environ.get("CODEX_HOME", "~/.codex")).expanduser()
+    roots = [Path(r).expanduser().resolve() for r in args.root] if args.root else [codex_home / "sessions", codex_home / "archived_sessions"]
+    json_stdout = args.json or args.output == "-"
+    tty_watch = args.command == "watch" and sys.stdout.isatty() and not json_stdout
+    colors = not args.no_color and "NO_COLOR" not in os.environ and (args.color or sys.stdout.isatty())
+    scanner = Scanner()
+    cache = ReportCache()
+    poller = None
+    screen_started = False
+    try:
+        if args.command == "watch" and args.quota in ("auto", "live"):
+            poller = QuotaPoller(args.codex_binary, args.timeout, args.quota_interval)
+            poller.start()
+        count = 0
+        while True:
+            tick = time.monotonic()
+            data = report(args, scanner, prices, calendar, roots, poller, cache)
+            if args.output and args.output != "-":
+                protected = {Path(__file__).resolve()} | set(scanner.cache)
+                write_json(Path(args.output), data, protected)
+            if json_stdout:
+                print(json.dumps(data, ensure_ascii=False, allow_nan=False,
+                                 indent=None if args.command == "watch" else 2), flush=True)
+            else:
+                size = shutil.get_terminal_size((120, 40))
+                body = render(data, args, calendar, size.columns)
+                if tty_watch:
+                    if not screen_started:
+                        sys.stdout.write("\033[?1049h\033[?25l")
+                        screen_started = True
+                    footer = fit(f"Refresh {args.refresh:g}s · {datetime.now().strftime('%H:%M:%S')} · Ctrl+C to quit", size.columns)
+                    lines = [fit(line, size.columns) for line in body.splitlines()]
+                    available = max(1, size.lines - 3)
+                    if len(lines) > available:
+                        notice = fit("… Full details: oai-usage --all or --output report.json", size.columns)
+                        lines = lines[:max(0, available - 1)] + [notice]
+                    if colors:
+                        lines = [style_line(line) for line in lines]
+                    sys.stdout.write("\033[H\033[2J" + "\n".join(lines) + "\n\n" + footer)
+                    sys.stdout.flush()
+                else:
+                    print("\n".join(style_line(line) for line in body.splitlines()) if colors else body, flush=True)
+                    if args.output:
+                        print(f"\nJSON saved: {args.output}")
+            count += 1
+            if args.command != "watch" or (args.count and count >= args.count):
+                return 0 if data["diagnostics"]["files"] else 1
+            time.sleep(max(.05, args.refresh - (time.monotonic() - tick)))
+    except KeyboardInterrupt:
+        return 0
+    except BrokenPipeError:
+        # Avoid a second BrokenPipeError when Python flushes stdout during shutdown.
+        try:
+            os.dup2(os.open(os.devnull, os.O_WRONLY), sys.stdout.fileno())
+        except (OSError, AttributeError):
+            pass
+        return 0
+    except (OSError, ValueError, OverflowError) as exc:
+        print(f"oai-usage: {exc}", file=sys.stderr)
+        return 1
+    finally:
+        if poller:
+            poller.stop()
+        if screen_started:
+            sys.stdout.write("\033[?1049l\033[?25h")
+            sys.stdout.flush()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
