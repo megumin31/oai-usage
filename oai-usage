@@ -30,7 +30,7 @@ from typing import Any, Optional
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 import oai_price_catalog as price_data
-from oai_price_catalog import (PRICE_FILE, PRICE_URL, Price, PriceCatalog, canonical_model,
+from oai_price_catalog import (PRICE_FILE, PRICE_URL, Price, PriceCatalog,
     catalog_info, clear_price_cache, default_prices, load_price_catalog,
     previous_cache_path, price_cache_path, read_price_catalog)
 
@@ -353,7 +353,7 @@ def account(rollouts: list) -> tuple:
                     if key in request_conflicts:
                         last = None
                     model = snap.model if prior.model == "unknown" else prior.model
-                    if prior.model != "unknown" and snap.model != "unknown" and canonical_model(prior.model) != canonical_model(snap.model):
+                    if prior.model != "unknown" and snap.model != "unknown" and prior.model != snap.model:
                         model_conflicts.add(key)
                         issues["conflicting_model_metadata"] += 1
                     if key in model_conflicts:
@@ -433,7 +433,7 @@ def price_overrides(values: list, base: Optional[dict] = None) -> dict:
     for spec in values:
         try:
             model, rates = spec.split("=", 1)
-            model = canonical_model(model)
+            model = model.strip()
             numbers = [Decimal(v.strip()) for v in rates.split(",")]
             if not model or len(numbers) not in (3, 4) or any(not n.is_finite() or n < 0 or n > Decimal("1e9") for n in numbers):
                 raise ValueError()
@@ -448,7 +448,8 @@ def price_overrides(values: list, base: Optional[dict] = None) -> dict:
                               scaled(numbers[0], reference.input, reference.long_input) if reference else None,
                               scaled(numbers[1], reference.cached, reference.long_cached) if reference else None,
                               scaled(write, reference.write, reference.long_write) if reference else None,
-                              scaled(numbers[2], reference.output, reference.long_output) if reference else None)
+                              scaled(numbers[2], reference.output, reference.long_output) if reference else None,
+                              old.model_source if old else None, old.rule_source if old else None)
     return prices
 
 
@@ -460,7 +461,7 @@ class Charge:
 
 
 def charge(event: Event, prices: dict, session_long: bool = False) -> Charge:
-    price = prices.get(canonical_model(event.model))
+    price = prices.get(event.model)
     if price is None:
         return Charge(complete=False, reasons=("unknown_model",))
     usage = event.usage
@@ -536,7 +537,7 @@ def priced_events(sessions: list, prices: dict) -> list:
         long_models = set()
         uncertain_models = set()
         for event in session.events:
-            model = canonical_model(event.model)
+            model = event.model
             price = prices.get(model)
             if not price or price.long_scope != "session" or not price.long_threshold:
                 continue
@@ -545,7 +546,7 @@ def priced_events(sessions: list, prices: dict) -> list:
             elif event.request_input is None and event.usage.input_tokens > price.long_threshold:
                 uncertain_models.add(model)
         for event in session.events:
-            model = canonical_model(event.model)
+            model = event.model
             cost = charge(event, prices, model in long_models)
             if model in uncertain_models and model not in long_models:
                 cost = replace(cost, complete=False, reasons=tuple(sorted(set(cost.reasons) | {"unknown_session_context"})))
@@ -633,19 +634,16 @@ def normalize_live(raw: Any, now: datetime) -> Optional[dict]:
     if not isinstance(raw, dict):
         return None
     buckets = {}
-    by_id = first(raw, "rateLimitsByLimitId", "rate_limits_by_limit_id")
+    by_id = raw.get("rateLimitsByLimitId")
     if isinstance(by_id, dict):
         for key, value in by_id.items():
             bucket = normalize_bucket(value, str(key))
             if bucket:
                 buckets[bucket["limit_id"]] = bucket
-    single = normalize_bucket(first(raw, "rateLimits", "rate_limits"), "codex")
-    if single:
-        buckets.setdefault(single["limit_id"], single)
     if not buckets:
         return None
-    reset = first(raw, "rateLimitResetCredits", "rate_limit_reset_credits")
-    credits = finite(first(reset, "availableCount", "available_count")) if isinstance(reset, dict) else None
+    reset = raw.get("rateLimitResetCredits")
+    credits = finite(reset.get("availableCount")) if isinstance(reset, dict) else None
     return {"source": "app_server", "fetched_at": now.isoformat(), "limits": buckets,
             "rate_limit_reset_credits": {"available_count": int(credits)} if credits is not None else None}
 
@@ -951,7 +949,7 @@ def report(args: argparse.Namespace, scanner: Scanner, prices: dict, calendar: C
                     "long_cached_input": str(p.long_cached) if p.long_cached is not None else None,
                     "long_cache_write": str(p.long_write) if p.long_write is not None else None,
                     "long_output": str(p.long_output) if p.long_output is not None else None,
-                    "source": p.source}
+                    "source": p.source, "model_source": p.model_source, "rule_source": p.rule_source}
                     for k, p in sorted(prices.items())}},
             "diagnostics": {"files": len(rollouts), "issues": dict(sorted(issues.items())),
                             "bytes_read_this_process": scanner.bytes_read},
@@ -1159,7 +1157,7 @@ def render(data: dict, args: argparse.Namespace, calendar: Calendar, columns: in
                         f"From {calendar.display(timestamp(period['start']))} to {calendar.display(timestamp(period['end']))}"]
     if data.get("pricing"):
         pricing = data["pricing"]
-        report_rows.append(f"Prices: {pricing['catalog_source']} · verified {pricing['verified_at']}" + (" · STALE" if pricing.get("stale") else ""))
+        report_rows.append(f"Prices: {pricing['catalog_source']} · checked {pricing['verified_at']}" + (" · STALE" if pricing.get("stale") else ""))
     lines += panel("Selected report period", report_rows, columns, wrap=not compact)
 
     # Compact watch already has the quota bar and dates inside each cycle card.
@@ -1294,12 +1292,10 @@ def pricing_options(parser: argparse.ArgumentParser) -> None:
 
 def parse_args(argv: Optional[list] = None) -> argparse.Namespace:
     args = list(sys.argv[1:] if argv is None else argv)
-    legacy_watch = any(v in ("-w", "--watch") for v in args)
-    if legacy_watch:
-        args = [v for v in args if v not in ("-w", "--watch")]
     if not args or args[0] not in ("report", "watch", "prices", "-h", "--help", "--version"):
-        args.insert(0, "watch" if legacy_watch else "report")
+        args.insert(0, "report")
     parser = argparse.ArgumentParser(prog="oai-usage", description="Local Codex usage, API-equivalent costs, and account quotas",
+        allow_abbrev=False,
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""Examples:
   oai-usage                         Last 30 days and current quota-cycle costs
@@ -1312,35 +1308,33 @@ def parse_args(argv: Optional[list] = None) -> argparse.Namespace:
     parser.add_argument("--version", action="version", version=f"oai-usage {VERSION}")
     sub = parser.add_subparsers(dest="command", required=True)
     for name, help_text in (("report", "Usage report (default)"), ("watch", "Continuously refresh usage")):
-        p = sub.add_parser(name, help=help_text, description=help_text)
+        p = sub.add_parser(name, help=help_text, description=help_text, allow_abbrev=False)
         dates = p.add_mutually_exclusive_group()
         dates.add_argument("--days", type=days_value, default=30, metavar="N|all", help="Last N x 24 hours; all for all history (default: 30)")
         dates.add_argument("--today", action="store_true", help="Today in the selected timezone")
         dates.add_argument("--since", metavar="YYYY-MM-DD", help="Inclusive start date")
         p.add_argument("--until", metavar="YYYY-MM-DD", help="Inclusive end date")
         p.add_argument("--timezone", default="local", metavar="ZONE", help="Calendar timezone, e.g. UTC or America/New_York (default: system timezone)")
-        p.add_argument("--by", "--group-by", choices=("model", "day", "week", "month", "session"), default="model", help="Grouping (default: model)")
-        p.add_argument("--all", "--all-dimensions", dest="all_dimensions", action="store_true", help="Show model, day, and session details together")
+        p.add_argument("--by", choices=("model", "day", "week", "month", "session"), default="model", help="Grouping (default: model)")
+        p.add_argument("--all", dest="all_dimensions", action="store_true", help="Show model, day, and session details together")
         p.add_argument("--top", type=int, default=15, help="Show N entries; 0 for all. JSON is never truncated (default: 15)")
         p.add_argument("--root", action="append", help="Replace default log directories; repeatable. Defaults use CODEX_HOME or ~/.codex")
-        p.add_argument("--quota", "--limits-source", choices=("auto", "live", "logs", "off"), default="auto", help="Quota source (default: live with log fallback)")
+        p.add_argument("--quota", choices=("auto", "live", "logs", "off"), default="auto", help="Quota source (default: live with log fallback)")
         p.add_argument("--limit", dest="limit_id", help="Select a quota bucket ID (default: prefer codex)")
-        projection = p.add_mutually_exclusive_group()
-        projection.add_argument("--project", dest="project", action="store_true", default=True, help="Show current-cycle costs and projections (default)")
-        projection.add_argument("--no-project", dest="project", action="store_false", help="Hide the current-cycle section in terminal output")
+        p.add_argument("--no-project", dest="project", action="store_false", help="Hide the current-cycle section in terminal output")
         p.add_argument("--codex-binary", help="Path to the Codex executable")
-        p.add_argument("--timeout", "--limits-timeout", type=positive, default=10, help="Live quota timeout in seconds (default: 10)")
+        p.add_argument("--timeout", type=positive, default=10, help="Live quota timeout in seconds (default: 10)")
         p.add_argument("--price", action="append", default=[], metavar="MODEL=IN,CACHED,OUT[,WRITE]", help="Custom USD rates per million tokens")
         pricing_options(p)
         p.add_argument("--json", action="store_true", help="Only print JSON to stdout; watch emits one JSON document per line")
-        p.add_argument("--output", "--json-out", help="Atomically save the full JSON report; - for stdout")
+        p.add_argument("--output", help="Atomically save the full JSON report; - for stdout")
         color = p.add_mutually_exclusive_group()
         color.add_argument("--no-color", action="store_true", help="Disable colors")
         color.add_argument("--color", action="store_true", help="Enable title colors")
-        p.add_argument("--refresh", "--interval", "-n", type=positive, default=2, help="Watch refresh interval in seconds (default: 2)")
+        p.add_argument("--refresh", type=positive, default=2, help="Watch refresh interval in seconds (default: 2)")
         p.add_argument("--quota-interval", type=positive, default=30, help="Watch live quota polling interval in seconds (default: 30)")
         p.add_argument("--count", type=int, default=0, help="Exit watch after N refreshes; 0 to keep running")
-    p = sub.add_parser("prices", help="Show current prices and official sources")
+    p = sub.add_parser("prices", help="Show current prices and data sources", allow_abbrev=False)
     p.add_argument("--json", action="store_true")
     pricing_options(p)
     parsed = parser.parse_args(args)
@@ -1370,6 +1364,7 @@ def main(argv: Optional[list] = None) -> int:
     if args.command == "prices":
         rows = [{"model": model, "input": str(p.input), "cached": str(p.cached), "output": str(p.output),
                  "cache_write": str(p.write) if p.write is not None else None, "source": p.source,
+                 "model_source": p.model_source, "rule_source": p.rule_source,
                  "long_context_threshold": p.long_threshold, "long_context_scope": p.long_scope,
                  "long_input": str(p.long_input) if p.long_input is not None else None,
                  "long_cached_input": str(p.long_cached) if p.long_cached is not None else None,
@@ -1379,7 +1374,7 @@ def main(argv: Optional[list] = None) -> int:
         if args.json:
             print(json.dumps({**catalog_info(price_catalog), "prices": rows}, ensure_ascii=False, indent=2))
         else:
-            print(f"Standard API prices · USD / 1M tokens · Verified {price_catalog.verified_at} · {price_catalog.origin}")
+            print(f"Standard API prices · USD / 1M tokens · Sources checked {price_catalog.verified_at} · {price_catalog.origin}")
             print("\n".join(table(["Model", "Input", "Cached", "Output", "Write"],
                 [[r['model'], r['input'], r['cached'], r['output'], r['cache_write'] or '-'] for r in rows])))
             for warning in catalog_info(price_catalog)["warnings"]:
@@ -1390,6 +1385,10 @@ def main(argv: Optional[list] = None) -> int:
                         f"input {r['long_input']}, cached {r['long_cached_input']}, "
                         f"write {r['long_cache_write'] or '-'}, output {r['long_output']}") if r['long_context_threshold'] else ""
                 print(f"{r['model']}{rule}: {r['source']}")
+                if r['model_source']:
+                    print(f"  Model: {r['model_source']}")
+                if r['rule_source']:
+                    print(f"  Context rule: {r['rule_source']}")
         return 0
     calendar = Calendar.make(args.timezone)
     prices = price_overrides(args.price, price_catalog.prices)

@@ -25,7 +25,7 @@ jobs:
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
           python-version: '3.14'
-      - name: Read and validate official Standard prices
+      - name: Match official OpenAI models with models.dev prices
         run: python3 scripts/update_prices.py --output candidate/prices.json
       - name: Verify calculator and price sync
         run: python3 -m unittest discover -s tests -q

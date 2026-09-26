@@ -51,6 +51,45 @@ class CatalogSecurity(unittest.TestCase):
         catalog = prices.parse_price_catalog(prices.strict_json(prices.read_limited(actual)), 'bundled')
         self.assertTrue(catalog.prices)
 
+    def test_current_provenance_and_cache_rotation(self):
+        new = copy.deepcopy(self.raw)
+        new['models']['gpt-6-sol']['input'] = '3'
+        self.load(self.raw)
+        result = self.load(new)
+        self.assertEqual(result.origin, 'github')
+        self.assertEqual(result.prices['gpt-6-sol'].source, prices.MODELS_DEV_URL)
+        self.assertEqual(prices.catalog_info(result)['model_source'], prices.MODEL_LIST_URL)
+        self.assertTrue(prices.previous_cache_path().exists())
+        for target, key, value in (
+            (new, 'provider', 'anthropic'), (new, 'source', 'https://evil.test/api.json'),
+            (new['models']['gpt-6-sol'], 'model_source', None),
+            (new['models']['gpt-6-sol'], 'model_source', 'https://developers.openai.com/api/docs/models/other'),
+            (new['models']['gpt-6-sol']['long_context'], 'source', prices.MODELS_DEV_URL),
+            (new['models']['gpt-6-sol']['long_context'], 'source', None),
+        ):
+            before = target[key]
+            target[key] = value
+            with self.subTest(key=key, value=value), self.assertRaises(ValueError):
+                prices.parse_price_catalog(new, 'candidate')
+            target[key] = before
+        # Upstream JSON numbers are enabled only in the CI adapter, not client data.
+        new['models']['gpt-6-sol']['input'] = 2.5
+        with self.assertRaises(ValueError):
+            prices.strict_json(encoded(new))
+
+    def test_old_schema_remote_and_cache_are_rejected(self):
+        old = copy.deepcopy(self.raw)
+        old['schema_version'] = 1
+        with self.assertRaisesRegex(ValueError, 'schema'):
+            prices.parse_price_catalog(old, 'old')
+        self.assertEqual(self.load(old).origin, 'bundled')
+        self.assertFalse(self.cache.exists())
+        self.load(self.raw)
+        envelope = json.loads(self.cache.read_text())
+        envelope['catalog'] = old
+        self.cache.write_bytes(encoded(envelope))
+        self.assertEqual(prices.load_price_catalog(offline=True).origin, 'bundled')
+
     def test_rejects_future_dates_duplicate_keys_nesting_and_bad_numbers(self):
         bad = copy.deepcopy(self.raw)
         bad['verified_at'] = '9999-12-31'
@@ -125,10 +164,12 @@ class CatalogSecurity(unittest.TestCase):
             with patch.dict(os.environ, {'OAI_USAGE_OFFLINE_PRICES': '1'}):
                 self.assertEqual(prices.load_price_catalog().origin, 'bundled')
 
-    def test_cache_size_bound_legacy_format_and_readonly_cache(self):
+    def test_cache_size_bound_rejects_bare_catalog_and_readonly_cache(self):
         self.cache.parent.mkdir(parents=True)
         self.cache.write_bytes(encoded(self.raw))
-        self.assertIsNone(prices.load_price_catalog(offline=True).fetched_at)
+        self.assertEqual(prices.load_price_catalog(offline=True).origin, 'bundled')
+        with self.assertRaises(ValueError):
+            prices.read_price_catalog(self.cache, 'cache')
         self.cache.write_bytes(b'x' * (prices.MAX_CACHE_BYTES + 1))
         self.assertEqual(prices.load_price_catalog(offline=True).origin, 'bundled')
         with patch.object(prices, 'cache_price_catalog', side_effect=PermissionError('read only')):
@@ -154,6 +195,20 @@ class CatalogSecurity(unittest.TestCase):
 
 
 class DownloadSecurity(unittest.TestCase):
+    def test_upstream_budget_does_not_expand_client_or_official_limits(self):
+        with patch.object(prices.subprocess, 'run', return_value=Mock(returncode=0, stdout=b'{}')) as proc:
+            prices.fetch_https(prices.MODELS_DEV_URL, limit=8_000_000)
+            self.assertEqual(proc.call_args.args[0][-2], '8000000')
+            for url, limit in ((prices.PRICE_URL, 1_000_001),
+                               ('https://developers.openai.com/api/docs/models/all.md', 2_000_001),
+                               (prices.MODELS_DEV_URL, 8_000_001)):
+                with self.subTest(url=url), self.assertRaises(ValueError):
+                    prices.fetch_https(url, limit=limit)
+        for url in ('https://models.dev.evil.test/api.json', 'https://models.dev/api.json?x=1',
+                    'https://models.dev@evil.test/api.json', 'http://models.dev/api.json'):
+            with self.subTest(url=url), self.assertRaises(prices.DownloadError):
+                prices.validate_download_url(url)
+
     def test_only_known_https_urls_and_no_redirects(self):
         for url in ('http://raw.githubusercontent.com/megumin31/oai-usage/main/prices.json',
                     'https://evil.example/prices.json', 'https://developers.openai.com.evil.example/api/docs/pricing.md',
@@ -161,7 +216,7 @@ class DownloadSecurity(unittest.TestCase):
             with self.subTest(url=url), self.assertRaises(prices.DownloadError), patch.object(prices.subprocess, 'run') as proc:
                 prices.fetch_https(url)
             proc.assert_not_called()
-        prices.validate_download_url('https://developers.openai.com/api/docs/models/gpt-5.4.md')
+        prices.validate_download_url('https://developers.openai.com/api/docs/models/all.md')
         for target in ('http://127.0.0.1/', 'https://evil.example/', prices.PRICE_URL):
             with self.subTest(target=target), self.assertRaises(prices.DownloadError):
                 prices.NoRedirect().redirect_request(urllib.request.Request(prices.PRICE_URL), None, 302, 'Found', {}, target)

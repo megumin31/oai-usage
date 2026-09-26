@@ -330,9 +330,9 @@ class Accounting(unittest.TestCase):
         e = M['Event']('s', at(), 'gpt-6-astra', U(100, 50, 20, 10, 5, 110), 100)
         self.assertEqual(M['charge'](e, fixture_prices()).amount, M['Decimal']('.0011'))
 
-    def test_alias_override_and_invalid_prices(self):
-        prices = M['price_overrides'](['astra=2,.2,10,2.5'], fixture_prices())
-        e = self.event('gpt6_astra-2026-09-04', n=1000000, request=100000)
+    def test_exact_model_override_and_invalid_prices(self):
+        prices = M['price_overrides'](['gpt-6-astra=2,.2,10,2.5'], fixture_prices())
+        e = self.event('gpt-6-astra', n=1000000, request=100000)
         self.assertEqual(M['charge'](e, prices).amount, M['Decimal']('2'))
         repeated = M['price_overrides'](['gpt-6-sol=0,0,0,0', 'gpt-6-sol=3,.3,15'], fixture_prices())
         self.assertEqual(repeated['gpt-6-sol'].write, M['Decimal']('3.75'))
@@ -342,6 +342,23 @@ class Accounting(unittest.TestCase):
             with self.assertRaises(ValueError, msg=value):
                 M['price_overrides']([value], fixture_prices())
 
+    def test_model_names_are_not_guessed_from_aliases_or_snapshots(self):
+        prices = fixture_prices()
+        for model in ('astra', 'gpt-astra', 'gpt6_astra', 'gpt-6-astra-2026-09-04',
+                      'gpt-6-astra-preview', 'gpt-6-astra-latest'):
+            with self.subTest(model=model):
+                charge = M['charge'](self.event(model), prices)
+                self.assertFalse(charge.complete)
+                self.assertIn('unknown_model', charge.reasons)
+
+    def test_removed_options_are_rejected(self):
+        for args in (['--watch'], ['-w'], ['--group-by', 'day'], ['--all-dimensions'],
+                     ['--limits-source', 'off'], ['--limits-timeout', '1'], ['--json-out', 'x'],
+                     ['--interval', '1'], ['-n', '1'], ['--project'], ['watch', '--ref', '1']):
+            with self.subTest(args=args), contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as error:
+                M['parse_args'](args)
+            self.assertEqual(error.exception.code, 2)
+
     def test_usage_validation(self):
         self.assertEqual(U.parse({'input_tokens': 0}), U())
         self.assertIsNone(U.parse({}))
@@ -349,8 +366,20 @@ class Accounting(unittest.TestCase):
         self.assertIsNone(U.parse({'input_tokens': 10**400}))
         self.assertIsNone(U.parse({'input_tokens': 1, 'cached_input_tokens': 2}))
 
-    def test_argument_validation_and_aliases(self):
-        args = M['parse_args'](['-w', '--limits-source', 'off', '-n', '1', '--json-out', 'a.json'])
+    def test_live_quota_requires_current_multi_bucket_response(self):
+        bucket = {'limitId': 'codex', 'primary': {'usedPercent': 20}}
+        for value in ({'rateLimits': bucket}, {'rate_limits': bucket},
+                      {'rateLimitsByLimitId': {}, 'rateLimits': bucket},
+                      {'rate_limits_by_limit_id': {'codex': bucket}}):
+            with self.subTest(value=value):
+                self.assertIsNone(M['normalize_live'](value, at()))
+        current = M['normalize_live']({'rateLimitsByLimitId': {'codex': bucket},
+                                       'rateLimitResetCredits': {'availableCount': 2}}, at())
+        self.assertEqual(current['limits']['codex']['primary']['used_percent'], 20)
+        self.assertEqual(current['rate_limit_reset_credits']['available_count'], 2)
+
+    def test_current_arguments_and_validation(self):
+        args = M['parse_args'](['watch', '--quota', 'off', '--refresh', '1', '--output', 'a.json'])
         self.assertEqual((args.command, args.quota, args.refresh, args.output), ('watch', 'off', 1, 'a.json'))
         for values in (['--refresh', 'nan'], ['--since', 'bad'], ['--timezone', 'Not/A/Zone'], ['--since','2026-09-22','--until','2026-09-20']):
             with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as error:
@@ -361,10 +390,10 @@ class Accounting(unittest.TestCase):
 class Presentation(unittest.TestCase):
     def data(self, used=50, unknown=False):
         now = at('2026-09-22T02:00:00Z')
-        current = M['normalize_live']({'rateLimits': {'limitId': 'codex', 'primary':
+        current = M['normalize_live']({'rateLimitsByLimitId': {'codex': {'limitId': 'codex', 'primary':
             {'usedPercent': used, 'windowDurationMins': 300, 'resetsAt': int(at('2026-09-22T05:00:00Z').timestamp())},
             'secondary': {'usedPercent': 25, 'windowDurationMins': 10080,
-                          'resetsAt': int(at('2026-09-28T00:00:00Z').timestamp())}}}, at())
+                          'resetsAt': int(at('2026-09-28T00:00:00Z').timestamp())}}}}, at())
         current = M['quota_status']('live', [], (current, None), now, None)
         rows = []
         for stamp, amount in [('2026-09-21T01:00:00Z', 10), ('2026-09-22T00:30:00Z', 20),
@@ -417,9 +446,9 @@ class Presentation(unittest.TestCase):
         self.assertIsNone(data['summary']['cycle_estimates']['primary']['local']['api_cost_usd'])
         self.assertIsNone(data['summary']['cycle_estimates']['primary']['projected_full_cycle_api_cost_usd'])
 
-    def test_projection_flag_compatibility_and_explicit_opt_out(self):
+    def test_current_cycle_default_and_explicit_opt_out(self):
         data = self.data()
-        self.assertEqual(self.render(data), self.render(data, '--project'))
+        self.assertIn('Current cycle', self.render(data))
         self.assertNotIn('Current cycle', self.render(data, '--no-project'))
         self.assertIn('Account quota', self.render(data, '--no-project'))
         self.assertEqual(len(data['summary']['cycle_estimates']), 2)
@@ -527,8 +556,8 @@ class Presentation(unittest.TestCase):
             def now(cls, tz=None):
                 return at('2026-09-22T02:00:00Z')
         def current(reset, used):
-            return M['normalize_live']({'rateLimits': {'limitId': 'codex', 'primary': {
-                'usedPercent': used, 'windowDurationMins': 10080, 'resetsAt': int(at(reset).timestamp())}}}, Clock.now())
+            return M['normalize_live']({'rateLimitsByLimitId': {'codex': {'limitId': 'codex', 'primary': {
+                'usedPercent': used, 'windowDurationMins': 10080, 'resetsAt': int(at(reset).timestamp())}}}}, Clock.now())
         with tempfile.TemporaryDirectory() as root:
             path = Path(root) / 'a.jsonl'
             path.write_text('\n'.join(json.dumps(row) for row in [meta(created='2026-09-21T00:00:00Z'), context(),
@@ -576,8 +605,8 @@ class Presentation(unittest.TestCase):
 
 class Quotas(unittest.TestCase):
     def current(self, reset='2026-09-22T05:00:00Z', observed='2026-09-22T01:00:00Z', used=50):
-        return M['normalize_live']({'rateLimits': {'limitId': 'codex', 'primary':
-            {'usedPercent': used, 'windowDurationMins': 300, 'resetsAt': int(at(reset).timestamp())}}}, at(observed))
+        return M['normalize_live']({'rateLimitsByLimitId': {'codex': {'limitId': 'codex', 'primary':
+            {'usedPercent': used, 'windowDurationMins': 300, 'resetsAt': int(at(reset).timestamp())}}}}, at(observed))
 
     def test_expired_window_never_projects(self):
         current = self.current(reset='2026-09-21T05:00:00Z', observed='2026-09-21T01:00:00Z')
@@ -630,7 +659,7 @@ for line in sys.stdin:
         print(json.dumps({'id':0,'result':{}}), flush=True)
     elif r.get('method')=='account/rateLimits/read':
         print(json.dumps({'method':'notification'}), flush=True)
-        print(json.dumps({'id':1,'result':{'rateLimits':{'limitId':'codex','primary':{'usedPercent':25}}}}), flush=True)
+        print(json.dumps({'id':1,'result':{'rateLimitsByLimitId':{'codex':{'limitId':'codex','primary':{'usedPercent':25}}}}}), flush=True)
 ''')
             fake.chmod(0o755)
             result, error = M['fetch_live'](str(fake), 2)

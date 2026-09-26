@@ -15,23 +15,16 @@ from decimal import Decimal
 from http.client import HTTPException
 from pathlib import Path
 from typing import Any, Optional
-from urllib.parse import urlsplit
 
 UTC = timezone.utc
 PRICE_URL = "https://raw.githubusercontent.com/megumin31/oai-usage/main/prices.json"
 PRICE_FILE = Path(__file__).resolve().with_name("prices.json")
+MODELS_DEV_URL = "https://models.dev/api.json"
+MODEL_LIST_URL = "https://developers.openai.com/api/docs/models/all"
 MAX_BYTES = 1_000_000
 MAX_CACHE_BYTES = MAX_BYTES + 1024
 STALE_DAYS = 45
-SOURCE = re.compile(r"https://developers\.openai\.com/api/docs/(?:pricing|models/[a-z0-9][a-z0-9._-]*)\Z")
 RATE = re.compile(r"[0-9]{1,10}(?:\.[0-9]{1,12})?\Z")
-
-
-def canonical_model(model: str) -> str:
-    name = model.strip().lower().replace("_", "-")
-    name = re.sub(r"^gpt(?=\d)", "gpt-", name)
-    name = re.sub(r"-(?:preview|latest|\d{4}-\d{2}-\d{2}|\d{8})$", "", name)
-    return "gpt-6-astra" if name in ("astra", "gpt-astra") else name
 
 
 @dataclass(frozen=True)
@@ -47,6 +40,8 @@ class Price:
     long_cached: Optional[Decimal] = None
     long_write: Optional[Decimal] = None
     long_output: Optional[Decimal] = None
+    model_source: Optional[str] = None
+    rule_source: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -56,6 +51,8 @@ class PriceCatalog:
     origin: str
     fetched_at: Optional[str] = None
     warnings: tuple = ()
+    source: Optional[str] = None
+    model_source: Optional[str] = None
 
 
 class DownloadError(ValueError):
@@ -68,11 +65,13 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
 
 
 def validate_download_url(url: str) -> None:
-    parts = urlsplit(url)
-    official = (parts.netloc == "developers.openai.com" and
-                re.fullmatch(r"/api/docs/(?:pricing|models/[a-z0-9][a-z0-9.-]{0,79})\.md", parts.path))
-    if parts.scheme != "https" or parts.query or parts.fragment or not (url == PRICE_URL or official):
+    if url not in (PRICE_URL, MODELS_DEV_URL, MODEL_LIST_URL + ".md"):
         raise DownloadError("Price download URL is not allowed")
+
+
+def download_budget(url: str) -> int:
+    validate_download_url(url)
+    return 8_000_000 if url == MODELS_DEV_URL else MAX_BYTES if url == PRICE_URL else 2_000_000
 
 
 def _download(url: str, limit: int, socket_timeout: float) -> bytes:
@@ -100,7 +99,7 @@ def _download(url: str, limit: int, socket_timeout: float) -> bytes:
 def fetch_https(url: str, limit: int = MAX_BYTES, total_timeout: float = 6,
                 socket_timeout: float = 3) -> bytes:
     validate_download_url(url)
-    if not 0 < limit <= 2_000_000 or not 0 < total_timeout <= 60 or not 0 < socket_timeout <= total_timeout:
+    if not 0 < limit <= download_budget(url) or not 0 < total_timeout <= 60 or not 0 < socket_timeout <= total_timeout:
         raise ValueError("Invalid price download limits")
     # A separate, fixed local worker lets the parent terminate DNS, TLS, and slow
     # reads together. Socket timeouts alone cannot bound the whole operation.
@@ -116,7 +115,8 @@ def fetch_https(url: str, limit: int = MAX_BYTES, total_timeout: float = 6,
     return result.stdout
 
 
-def strict_json(data: bytes, limit: int = MAX_BYTES, max_depth: int = 8) -> Any:
+def strict_json(data: bytes, limit: int = MAX_BYTES, max_depth: int = 8,
+                decimal_numbers: bool = False, max_string: int = 4096) -> Any:
     if len(data) > limit:
         raise ValueError("Price data is too large")
     text = data.decode("utf-8")
@@ -124,7 +124,7 @@ def strict_json(data: bytes, limit: int = MAX_BYTES, max_depth: int = 8) -> Any:
     for char in text:
         if quoted:
             width += 1
-            if width > 4096:
+            if width > max_string:
                 raise ValueError("Price JSON string is too long")
             if escaped:
                 escaped = False
@@ -157,9 +157,18 @@ def strict_json(data: bytes, limit: int = MAX_BYTES, max_depth: int = 8) -> Any:
     def reject_number(value):
         raise ValueError("Price JSON rates must be decimal strings")
 
+    def decimal_number(value):
+        if len(value) > 40:
+            raise ValueError("Price JSON number is too long")
+        number = Decimal(value)
+        if not number.is_finite() or abs(number.adjusted()) > 100 or number.as_tuple().exponent < -100:
+            raise ValueError("Price JSON number is out of range")
+        return number
+
     try:
         return json.loads(text, object_pairs_hook=pairs, parse_int=integer,
-                          parse_float=reject_number, parse_constant=reject_number)
+                          parse_float=decimal_number if decimal_numbers else reject_number,
+                          parse_constant=reject_number)
     except RecursionError:
         raise ValueError("Price JSON is nested too deeply")
 
@@ -170,9 +179,13 @@ def exact_keys(value: Any, expected: set) -> None:
 
 
 def parse_price_catalog(raw: Any, origin: str, today: Optional[date] = None) -> PriceCatalog:
-    exact_keys(raw, {"schema_version", "basis", "verified_at", "source", "models"})
-    if type(raw["schema_version"]) is not int or raw["schema_version"] != 1 or raw["basis"] != "standard_api_equivalent":
+    exact_keys(raw, {"schema_version", "basis", "verified_at", "source", "models", "provider", "model_source"})
+    if type(raw["schema_version"]) is not int or raw["schema_version"] != 2 or raw["basis"] != "standard_api_equivalent":
         raise ValueError("Invalid price catalog schema or basis")
+    if raw["provider"] != "openai" or raw["model_source"] != MODEL_LIST_URL:
+        raise ValueError("Invalid price catalog model provider")
+    if raw["source"] != MODELS_DEV_URL:
+        raise ValueError("Invalid price catalog upstream source")
     verified_at = raw["verified_at"]
     today = today or datetime.now(UTC).date()
     try:
@@ -184,11 +197,6 @@ def parse_price_catalog(raw: Any, origin: str, today: Optional[date] = None) -> 
     except ValueError:
         raise ValueError("Invalid or future price verification date")
 
-    def source(value):
-        if not isinstance(value, str) or len(value) > 256 or not SOURCE.fullmatch(value):
-            raise ValueError("Invalid price catalog source")
-        return value
-
     def amount(value, optional=False):
         if value is None and optional:
             return None
@@ -199,33 +207,39 @@ def parse_price_catalog(raw: Any, origin: str, today: Optional[date] = None) -> 
             raise ValueError("Price catalog rate is out of range")
         return number
 
-    source(raw["source"])
     models = raw["models"]
     if not isinstance(models, dict) or not 1 <= len(models) <= 200:
         raise ValueError("Invalid price catalog models")
     prices = {}
     for model, row in models.items():
-        if (not isinstance(model, str) or not re.fullmatch(r"[a-z0-9][a-z0-9._-]{0,79}", model)
-                or model != canonical_model(model)):
+        if not isinstance(model, str) or not re.fullmatch(r"[a-z0-9][a-z0-9._-]{0,79}", model):
             raise ValueError("Invalid price catalog model")
-        exact_keys(row, {"input", "cached_input", "cache_write", "output", "long_context", "source"})
+        exact_keys(row, {"input", "cached_input", "cache_write", "output", "long_context", "source", "model_source"})
+        expected_source = "https://developers.openai.com/api/docs/models/" + model
+        if row["model_source"] != expected_source:
+            raise ValueError("Invalid model identity source")
+        if row["source"] != MODELS_DEV_URL:
+            raise ValueError("Invalid model price source")
         long = row["long_context"]
         threshold, scope = None, "request"
         if long is not None:
-            exact_keys(long, {"threshold", "scope", "input", "cached_input", "cache_write", "output"})
+            exact_keys(long, {"threshold", "scope", "input", "cached_input", "cache_write", "output", "source"})
             threshold, scope = long["threshold"], long["scope"]
             if type(threshold) is not int or not 0 < threshold <= 10_000_000 or scope not in ("request", "session"):
                 raise ValueError("Invalid long-context rule")
+            if long["source"] != expected_source:
+                raise ValueError("Invalid long-context rule source")
         write = amount(row["cache_write"], True)
         long_write = amount(long["cache_write"], True) if long else None
         if long and (write is None) != (long_write is None):
             raise ValueError("Inconsistent cache-write rates")
         prices[model] = Price(amount(row["input"]), amount(row["cached_input"]), amount(row["output"]),
-                              write, threshold, scope, source(row["source"]),
+                              write, threshold, scope, row["source"],
                               amount(long["input"]) if long else None,
                               amount(long["cached_input"]) if long else None,
-                              long_write, amount(long["output"]) if long else None)
-    return PriceCatalog(prices, verified_at, origin)
+                              long_write, amount(long["output"]) if long else None,
+                              row["model_source"], long["source"] if long else None)
+    return PriceCatalog(prices, verified_at, origin, source=raw["source"], model_source=raw["model_source"])
 
 
 def read_limited(path: Path, limit: int = MAX_BYTES) -> bytes:
@@ -247,7 +261,7 @@ def previous_cache_path() -> Path:
 def read_price_catalog(path: Path, origin: str) -> PriceCatalog:
     raw = strict_json(read_limited(path, MAX_CACHE_BYTES), MAX_CACHE_BYTES)
     fetched_at = None
-    if isinstance(raw, dict) and "cache_schema_version" in raw and origin in ("cache", "previous_cache"):
+    if origin in ("cache", "previous_cache"):
         exact_keys(raw, {"cache_schema_version", "fetched_at", "catalog"})
         if type(raw["cache_schema_version"]) is not int or raw["cache_schema_version"] != 1:
             raise ValueError("Invalid price cache version")
@@ -302,9 +316,10 @@ def catalog_info(catalog: PriceCatalog) -> dict:
     stale = (datetime.now(UTC).date() - date.fromisoformat(catalog.verified_at)).days > STALE_DAYS
     warnings = list(catalog.warnings)
     if stale:
-        warnings.append(f"Prices were last verified more than {STALE_DAYS} days ago.")
+        warnings.append(f"Price sources were last checked more than {STALE_DAYS} days ago.")
     return {"verified_at": catalog.verified_at, "catalog_source": catalog.origin,
-            "fetched_at": catalog.fetched_at, "stale": stale, "warnings": warnings}
+            "fetched_at": catalog.fetched_at, "stale": stale, "warnings": warnings,
+            "price_source": catalog.source, "model_source": catalog.model_source}
 
 
 def load_price_catalog(offline: bool = False, bundled_only: bool = False) -> PriceCatalog:
@@ -338,7 +353,7 @@ if __name__ == "__main__":
         raise SystemExit("This module is loaded by oai-usage; it is not a standalone command")
     try:
         download_limit, read_timeout = int(sys.argv[3]), float(sys.argv[4])
-        if not 0 < download_limit <= 2_000_000 or not 0 < read_timeout <= 60:
+        if not 0 < download_limit <= download_budget(sys.argv[2]) or not 0 < read_timeout <= 60:
             raise ValueError("Invalid download limits")
         sys.stdout.buffer.write(_download(sys.argv[2], download_limit, read_timeout))
     except (OSError, ValueError, HTTPException):
