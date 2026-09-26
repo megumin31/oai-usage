@@ -6,7 +6,7 @@ import argparse
 import json
 import re
 import urllib.request
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from decimal import Decimal
 from pathlib import Path
 from typing import Optional
@@ -126,7 +126,11 @@ def updated_catalog(old: dict, observed: dict[str, dict], today: str) -> dict:
         raise ValueError("Existing catalog has invalid models")
     models = {**previous, **observed}
     if models == previous:
-        return old
+        try:
+            age = (date.fromisoformat(today) - date.fromisoformat(old["verified_at"])).days
+        except (KeyError, TypeError, ValueError):
+            raise ValueError("Existing catalog has an invalid verification date")
+        return old if age < 30 else {**old, "verified_at": today}
     return {"schema_version": 1, "basis": "standard_api_equivalent",
             "verified_at": today, "source": PRICING_URL.removesuffix(".md"),
             "models": dict(sorted(models.items()))}
@@ -142,8 +146,8 @@ def main() -> int:
     new = updated_catalog(old, observed, today)
     changed = sorted(model for model, value in new["models"].items()
                      if value != old.get("models", {}).get(model))
-    if changed:
-        print("Updated models: " + ", ".join(changed))
+    if new != old:
+        print("Updated models: " + ", ".join(changed) if changed else "Refreshed price verification date")
         if not args.dry_run:
             CATALOG.write_text(json.dumps(new, ensure_ascii=False, indent=2) + "\n")
     else:

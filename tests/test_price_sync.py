@@ -49,6 +49,10 @@ class PriceSync(unittest.TestCase):
         old = {'schema_version': 1, 'basis': 'standard_api_equivalent',
                'verified_at': '2026-09-26', 'models': observed}
         self.assertIs(sync.updated_catalog(old, observed, '2026-09-27'), old)
+        refreshed = sync.updated_catalog(old, observed, '2026-10-26')
+        self.assertEqual(refreshed['verified_at'], '2026-10-26')
+        self.assertEqual(refreshed['models'], observed)
+        self.assertEqual(old['verified_at'], '2026-09-26')
 
 
 if __name__ == '__main__':
