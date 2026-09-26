@@ -21,6 +21,10 @@ UTC = M['UTC']
 DT = M['datetime']
 
 
+def fixture_prices():
+    return M['read_price_catalog'](Path(__file__).parent / 'fixtures/prices.json', 'fixture').prices
+
+
 def at(value='2026-09-22T01:00:00Z'):
     return M['timestamp'](value)
 
@@ -107,7 +111,7 @@ class Fixtures(unittest.TestCase):
         self.write('a.jsonl', [meta(), context(), token(300000, out=1000)])
         self.write('b.jsonl', [meta(), context(), token(300000, last=300000, out=1000)])
         sessions, _ = self.scan()
-        rows = M['priced_events'](sessions, M['default_prices']())
+        rows = M['priced_events'](sessions, fixture_prices())
         self.assertEqual(rows[0][0].request_input, 300000)
         self.assertEqual(rows[0][1].amount, M['Decimal']('6.075'))
         self.assertTrue(rows[0][1].complete)
@@ -116,7 +120,7 @@ class Fixtures(unittest.TestCase):
         for name, last in [('a',100000), ('b',300000), ('c',300000)]:
             self.write(name+'.jsonl', [meta(), context(), token(300000, last=last)])
         sessions, issues = self.scan()
-        cost = M['priced_events'](sessions, M['default_prices']())[0][1]
+        cost = M['priced_events'](sessions, fixture_prices())[0][1]
         self.assertFalse(cost.complete)
         self.assertGreater(issues['conflicting_request_metadata'], 0)
 
@@ -186,7 +190,7 @@ class Fixtures(unittest.TestCase):
     def test_report_cache_reuses_unchanged_accounting(self):
         path = self.write('a.jsonl', [meta(), context(), token(100, last=100)])
         scanner, cache = M['Scanner'](), M['ReportCache']()
-        prices = M['default_prices']()
+        prices = fixture_prices()
         cache.prepare(scanner, scanner.scan([self.root]), prices)
         original_rows = cache.rows
         with path.open('a') as f:
@@ -201,7 +205,7 @@ class Fixtures(unittest.TestCase):
     def test_report_cache_reprices_when_catalog_changes(self):
         self.write('a.jsonl', [meta(), context('gpt-6-sol'), token(100000, last=100000)])
         scanner, cache = M['Scanner'](), M['ReportCache']()
-        prices = M['default_prices']()
+        prices = fixture_prices()
         cache.prepare(scanner, scanner.scan([self.root]), prices)
         old_cost = cache.rows[0][1].amount
         changed = dict(prices)
@@ -213,7 +217,7 @@ class Fixtures(unittest.TestCase):
     def test_report_cache_invalidates_at_time_boundary(self):
         self.write('a.jsonl', [meta(), context(), token(100, 1, last=100), token(150, 2, last=50)])
         scanner, cache = M['Scanner'](), M['ReportCache']()
-        cache.prepare(scanner, scanner.scan([self.root]), M['default_prices']())
+        cache.prepare(scanner, scanner.scan([self.root]), fixture_prices())
         cal = M['Calendar'].make('UTC')
         first = cache.summarize(cal, at('2026-09-22T00:01:00Z'), at(), 'day')
         second = cache.summarize(cal, at('2026-09-22T00:01:01Z'), at(), 'day')
@@ -285,52 +289,21 @@ class Accounting(unittest.TestCase):
     def test_unknown_price_consistency(self):
         e = self.event('internal-unknown', 1000000)
         b = M['Bucket']()
-        b.add(e, M['charge'](e, M['default_prices']()))
+        b.add(e, M['charge'](e, fixture_prices()))
         result = b.export()
         self.assertIsNone(result['api_cost_usd'])
         self.assertEqual(result['known_api_cost_usd'], 0)
         self.assertEqual(result['unpriced_usage']['total_tokens'], 1000000)
 
-    @patch.dict(os.environ, {'OAI_USAGE_OFFLINE_PRICES': '0'})
-    def test_remote_price_catalog_and_offline_fallback(self):
-        raw = json.loads((SCRIPT.parent / 'prices.json').read_text())
-        raw['models']['gpt-6-sol']['input'] = '3.00'
-        data = json.dumps(raw).encode()
-        with tempfile.TemporaryDirectory() as root:
-            cache_path = Path(root) / 'prices.json'
-            with patch.dict(G, {'price_cache_path': lambda: cache_path}), \
-                 patch.object(M['urllib'].request, 'urlopen', return_value=io.BytesIO(data)):
-                live = M['load_price_catalog']()
-            self.assertEqual(live.origin, 'github')
-            self.assertEqual(live.prices['gpt-6-sol'].input, M['Decimal']('3.00'))
-            self.assertEqual(cache_path.read_bytes(), data)
-            with patch.dict(G, {'price_cache_path': lambda: cache_path}), \
-                 patch.object(M['urllib'].request, 'urlopen', side_effect=OSError('offline')):
-                cached = M['load_price_catalog']()
-            self.assertEqual(cached.origin, 'cache')
-            self.assertEqual(cached.prices['gpt-6-sol'].input, M['Decimal']('3.00'))
-            raw['models']['gpt-6-sol']['input'] = '-1'
-            with patch.dict(G, {'price_cache_path': lambda: cache_path}), \
-                 patch.object(M['urllib'].request, 'urlopen', return_value=io.BytesIO(json.dumps(raw).encode())):
-                rejected = M['load_price_catalog']()
-            self.assertEqual(rejected.origin, 'cache')
-            self.assertEqual(cache_path.read_bytes(), data)
-            old = json.loads(data)
-            old['verified_at'] = '2026-01-01'
-            cache_path.write_text(json.dumps(old))
-            with patch.dict(G, {'price_cache_path': lambda: cache_path}):
-                bundled = M['load_price_catalog'](offline=True)
-            self.assertEqual(bundled.origin, 'bundled')
-
     def test_long_context_per_request(self):
-        prices = M['default_prices']()
+        prices = fixture_prices()
         e = self.event(n=300000, out=1000, request=300000)
         self.assertEqual(M['charge'](e, prices).amount, M['Decimal']('6.075'))
         small = self.event(n=150000, out=500, request=150000)
         self.assertEqual(2 * M['charge'](small, prices).amount, M['Decimal']('3.05'))
 
     def test_new_gpt6_models_include_cache_and_request_long_context(self):
-        prices = M['default_prices']()
+        prices = fixture_prices()
         for model, short_cost, long_cost in (
             ('gpt-6-sol', '.179', '1.215'),
             ('gpt-6-luna', '.00895', '.06075'),
@@ -342,7 +315,7 @@ class Accounting(unittest.TestCase):
                 self.assertEqual(M['charge'](long, prices).amount, M['Decimal'](long_cost))
 
     def test_threshold_and_unknown_request(self):
-        prices = M['default_prices']()
+        prices = fixture_prices()
         self.assertEqual(M['charge'](self.event(n=272000, request=272000), prices).amount, M['Decimal']('2.72'))
         self.assertFalse(M['charge'](self.event(n=300000), prices).complete)
         self.assertTrue(M['charge'](self.event(n=100000), prices).complete)
@@ -350,24 +323,24 @@ class Accounting(unittest.TestCase):
     def test_session_long_context_applies_before_date_filter(self):
         events = [self.event('gpt-5.5', n=100000, request=100000), self.event('gpt-5.5', n=300000, request=300000)]
         session = M['Session']('session', None, None, [], events)
-        rows = M['priced_events']([session], M['default_prices']())
+        rows = M['priced_events']([session], fixture_prices())
         self.assertEqual(rows[0][1].amount, M['Decimal']('1'))
 
     def test_cache_write_and_reasoning_not_double_counted(self):
         e = M['Event']('s', at(), 'gpt-6-astra', U(100, 50, 20, 10, 5, 110), 100)
-        self.assertEqual(M['charge'](e, M['default_prices']()).amount, M['Decimal']('.0011'))
+        self.assertEqual(M['charge'](e, fixture_prices()).amount, M['Decimal']('.0011'))
 
     def test_alias_override_and_invalid_prices(self):
-        prices = M['price_overrides'](['astra=2,.2,10,2.5'])
+        prices = M['price_overrides'](['astra=2,.2,10,2.5'], fixture_prices())
         e = self.event('gpt6_astra-2026-09-04', n=1000000, request=100000)
         self.assertEqual(M['charge'](e, prices).amount, M['Decimal']('2'))
-        repeated = M['price_overrides'](['gpt-6-sol=0,0,0,0', 'gpt-6-sol=3,.3,15'])
+        repeated = M['price_overrides'](['gpt-6-sol=0,0,0,0', 'gpt-6-sol=3,.3,15'], fixture_prices())
         self.assertEqual(repeated['gpt-6-sol'].write, M['Decimal']('3.75'))
         self.assertEqual(M['charge'](self.event('gpt-6-sol', n=300000, out=1000, request=300000),
                                       repeated).amount, M['Decimal']('1.8225'))
         for value in ('x=nan,1,2', 'x=-1,0,2', 'x=1,inf,2', '=1,2,3', 'x=1,2', 'x=1e999,1,1'):
             with self.assertRaises(ValueError, msg=value):
-                M['price_overrides']([value])
+                M['price_overrides']([value], fixture_prices())
 
     def test_usage_validation(self):
         self.assertEqual(U.parse({'input_tokens': 0}), U())
@@ -569,9 +542,9 @@ class Presentation(unittest.TestCase):
             scanner, cache = M['Scanner'](), M['ReportCache']()
             with patch.dict(G, {'datetime': Clock}):
                 args = M['parse_args'](['watch', '--days', 'all', '--quota', 'live'])
-                old = M['report'](args, scanner, M['default_prices'](), M['Calendar'].make('UTC'), [Path(root)], Poller(), cache)
+                old = M['report'](args, scanner, fixture_prices(), M['Calendar'].make('UTC'), [Path(root)], Poller(), cache)
                 bytes_before = scanner.bytes_read
-                new = M['report'](args, scanner, M['default_prices'](), M['Calendar'].make('UTC'), [Path(root)], Poller(), cache)
+                new = M['report'](args, scanner, fixture_prices(), M['Calendar'].make('UTC'), [Path(root)], Poller(), cache)
             self.assertEqual(scanner.bytes_read, bytes_before)
             before, after = [d['summary']['cycle_estimates']['primary'] for d in (old, new)]
             self.assertEqual(before['local']['usage']['total_tokens'], 300)
@@ -593,7 +566,7 @@ class Presentation(unittest.TestCase):
             current = self.data()['summary']['current_rate_limits']
             with patch.dict(G, {'datetime': Clock, 'fetch_live': lambda *a: (current, None)}):
                 args = M['parse_args'](['--since', '2026-09-01', '--until', '2026-09-02', '--timezone', 'UTC'])
-                data = M['report'](args, M['Scanner'](), M['default_prices'](), M['Calendar'].make('UTC'), [Path(root)])
+                data = M['report'](args, M['Scanner'](), fixture_prices(), M['Calendar'].make('UTC'), [Path(root)])
             self.assertEqual(data['summary']['usage']['total_tokens'], 0)
             self.assertEqual(data['summary']['cycle_estimates']['primary']['local']['usage']['total_tokens'], 100)
             text = M['render'](data, args, M['Calendar'].make('UTC'))
@@ -618,7 +591,7 @@ class Quotas(unittest.TestCase):
         current = self.current()
         current['active_limit_id'] = 'codex'
         event = M['Event']('s', at('2026-09-22T00:30:00Z'), 'gpt-6-astra', usage(1000000), 100000)
-        rows = [(event, M['charge'](event, M['default_prices']()))]
+        rows = [(event, M['charge'](event, fixture_prices()))]
         result = M['projections'](rows, current, at('2026-09-22T02:00:00Z'))['primary']
         self.assertEqual(result['projected_remaining_api_cost_usd'], 10)
         current['limits']['codex']['primary']['used_percent'] = 0

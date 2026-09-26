@@ -1,4 +1,11 @@
+import copy
+import io
+import json
+import tempfile
 import unittest
+from contextlib import redirect_stdout
+from pathlib import Path
+from unittest.mock import patch
 
 from scripts import update_prices as sync
 
@@ -18,6 +25,9 @@ def markdown(extra=''):
 
 
 class PriceSync(unittest.TestCase):
+    def baseline(self):
+        return json.loads((Path(__file__).parent / 'fixtures/prices.json').read_text())
+
     def test_discovers_new_standard_model_and_scope(self):
         row = '| gpt-7-sol | $3 | $0.3 | $3.75 | $12 | $6 | $0.6 | $7.5 | $18 |'
         page = '- Prompts with more than 272K input tokens are priced for the full request.'
@@ -53,6 +63,72 @@ class PriceSync(unittest.TestCase):
         self.assertEqual(refreshed['verified_at'], '2026-10-26')
         self.assertEqual(refreshed['models'], observed)
         self.assertEqual(old['verified_at'], '2026-09-26')
+
+    def test_accepts_normal_price_change_and_new_model(self):
+        old = self.baseline()
+        new = copy.deepcopy(old)
+        new['models']['gpt-6-sol']['input'] = '3'
+        new['models']['gpt-6-sol']['long_context']['input'] = '6'
+        new['models']['gpt-7-sol'] = copy.deepcopy(new['models']['gpt-6-sol'])
+        sync.validate_transition(old, new)
+
+    def test_blocks_zero_extreme_prices_rule_changes_and_missing_models(self):
+        old = self.baseline()
+        for value in ('0', '100', '0.01'):
+            new = copy.deepcopy(old)
+            new['models']['gpt-6-sol']['input'] = value
+            with self.subTest(value=value), self.assertRaisesRegex(ValueError, 'Review required'):
+                sync.validate_transition(old, new)
+        new = copy.deepcopy(old)
+        new['models']['gpt-6-sol']['long_context']['scope'] = 'session'
+        with self.assertRaisesRegex(ValueError, 'Review required'):
+            sync.validate_transition(old, new)
+        observed = set(old['models']) - {'gpt-5.4', 'gpt-5.4-mini', 'gpt-5.4-nano'}
+        with self.assertRaisesRegex(ValueError, '25%'):
+            sync.validate_transition(old, old, observed)
+
+    def test_new_models_require_review_for_any_zero_rate(self):
+        old = self.baseline()
+        for long_context in (False, True):
+            for field in ('input', 'cached_input', 'cache_write', 'output'):
+                new = copy.deepcopy(old)
+                new['models']['gpt-7-sol'] = copy.deepcopy(old['models']['gpt-6-sol'])
+                row = new['models']['gpt-7-sol']
+                if long_context:
+                    row = row['long_context']
+                row[field] = '0'
+                with self.subTest(long_context=long_context, field=field), self.assertRaisesRegex(ValueError, 'zero price'):
+                    sync.validate_transition(old, new)
+        new = copy.deepcopy(old)
+        new['models']['gpt-7-sol'] = copy.deepcopy(old['models']['gpt-6-sol'])
+        new['models']['gpt-7-sol']['cache_write'] = None
+        new['models']['gpt-7-sol']['long_context']['cache_write'] = None
+        sync.validate_transition(old, new)
+
+    def test_failed_sync_and_dry_run_never_replace_baseline(self):
+        old = self.baseline()
+        with tempfile.TemporaryDirectory() as root:
+            baseline = Path(root) / 'prices.json'
+            candidate = Path(root) / 'candidate.json'
+            baseline.write_text(json.dumps(old))
+            before = baseline.read_bytes()
+            observed = copy.deepcopy(old['models'])
+            observed['gpt-6-sol']['input'] = '0'
+            with patch.object(sync, 'CATALOG', baseline), patch.object(sync, 'fetch', return_value=''), \
+                 patch.object(sync, 'collect', return_value=observed), patch('sys.argv', ['sync']), self.assertRaises(ValueError):
+                sync.main()
+            self.assertEqual(baseline.read_bytes(), before)
+            with patch.object(sync, 'CATALOG', baseline), patch.object(sync, 'fetch', return_value=''), \
+                 patch.object(sync, 'collect', return_value=old['models']), redirect_stdout(io.StringIO()):
+                with patch('sys.argv', ['sync', '--dry-run', '--output', str(candidate)]):
+                    sync.main()
+                self.assertFalse(candidate.exists())
+                with patch('sys.argv', ['sync', '--output', str(candidate)]):
+                    sync.main()
+                self.assertEqual(json.loads(candidate.read_text())['models'], old['models'])
+            with patch.object(sync, 'CATALOG', baseline), patch.object(sync, 'fetch', side_effect=AssertionError('No network')), \
+                 patch('sys.argv', ['sync', '--validate', str(candidate)]), redirect_stdout(io.StringIO()):
+                self.assertEqual(sync.main(), 0)
 
 
 if __name__ == '__main__':

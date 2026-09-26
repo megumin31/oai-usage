@@ -5,13 +5,16 @@ from __future__ import annotations
 import argparse
 import json
 import re
-import urllib.request
+import sys
 from datetime import date, datetime, timezone
 from decimal import Decimal
 from pathlib import Path
 from typing import Optional
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+import oai_price_catalog as catalog
+
 CATALOG = ROOT / "prices.json"
 PRICING_URL = "https://developers.openai.com/api/docs/pricing.md"
 MODEL_URL = "https://developers.openai.com/api/docs/models/{}.md"
@@ -25,12 +28,9 @@ HEADERS = ["Model", "Short context input", "Short context cached input", "Short 
 
 
 def fetch(url: str) -> str:
-    request = urllib.request.Request(url, headers={"User-Agent": "oai-usage-price-sync/1.0"})
-    with urllib.request.urlopen(request, timeout=20) as response:
-        data = response.read(2_000_001)
-    if len(data) > 2_000_000:
-        raise ValueError(f"Official page is too large: {url}")
-    return data.decode("utf-8")
+    # Official Markdown pages have a separate CI budget from the small client
+    # catalog: 2 MB, 5 seconds per socket operation, 20 seconds total per page.
+    return catalog.fetch_https(url, limit=2_000_000, total_timeout=20, socket_timeout=5).decode("utf-8")
 
 
 def cells(line: str) -> list[str]:
@@ -40,7 +40,7 @@ def cells(line: str) -> list[str]:
 def rate(value: str) -> Optional[Decimal]:
     if value == "-":
         return None
-    if not re.fullmatch(r"\$\d+(?:\.\d+)?", value):
+    if len(value) > 25 or not catalog.RATE.fullmatch(value.removeprefix("$")) or not value.startswith("$"):
         raise ValueError(f"Unexpected price cell: {value!r}")
     number = Decimal(value[1:])
     if number > Decimal("1e9"):
@@ -93,7 +93,7 @@ def collect(markdown: str, fetch_page=fetch) -> dict[str, dict]:
     for row in standard_rows(markdown):
         model = re.sub(r"\s+\([^)]*\)\Z", "", row[0])
         match = MODEL_ID.fullmatch(model)
-        if not match or (int(match.group(1)), int(match.group(2) or 0)) < (5, 4):
+        if len(model) > 80 or not match or (int(match.group(1)), int(match.group(2) or 0)) < (5, 4):
             continue
         amounts = [rate(cell) for cell in row[1:]]
         base, long = amounts[:4], amounts[4:]
@@ -136,22 +136,55 @@ def updated_catalog(old: dict, observed: dict[str, dict], today: str) -> dict:
             "models": dict(sorted(models.items()))}
 
 
+def validate_transition(old: dict, new: dict, observed: Optional[set] = None) -> None:
+    previous = catalog.parse_price_catalog(old, "baseline")
+    incoming = catalog.parse_price_catalog(new, "candidate")
+    missing = previous.prices.keys() - (incoming.prices.keys() if observed is None else observed)
+    if len(missing) >= 2 and len(missing) * 4 >= len(previous.prices):
+        raise ValueError("Review required: at least 25% of known models disappeared")
+    rate_fields = ("input", "cached", "write", "output", "long_input", "long_cached", "long_write", "long_output")
+    for model, price in incoming.prices.items():
+        prior = previous.prices.get(model)
+        if prior is None:
+            if any(getattr(price, name) == 0 for name in rate_fields):
+                raise ValueError(f"Review required: zero price for new model {model}")
+            continue
+        if (price.long_threshold, price.long_scope) != (prior.long_threshold, prior.long_scope):
+            raise ValueError(f"Review required: changed long-context rules for {model}")
+        for name in rate_fields:
+            before, after = getattr(prior, name), getattr(price, name)
+            if (before is None) != (after is None):
+                raise ValueError(f"Review required: changed availability of {model} {name} price")
+            if before is None or before == after:
+                continue
+            if before == 0 or after == 0 or after > before * 3 or after * 3 < before:
+                raise ValueError(f"Review required: unexpected change to {model} {name} price")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dry-run", action="store_true", help="Check official prices without writing prices.json")
+    parser.add_argument("--output", type=Path, default=CATALOG, help="Write the validated candidate to this path")
+    parser.add_argument("--validate", type=Path, help="Validate a candidate against prices.json without network access or writes")
     args = parser.parse_args()
-    old = json.loads(CATALOG.read_text()) if CATALOG.exists() else {}
+    old = catalog.strict_json(catalog.read_limited(CATALOG))
+    catalog.parse_price_catalog(old, "baseline")
+    if args.validate:
+        validate_transition(old, catalog.strict_json(catalog.read_limited(args.validate)))
+        print("Price candidate is valid")
+        return 0
     observed = collect(fetch(PRICING_URL))
     today = datetime.now(timezone.utc).date().isoformat()
     new = updated_catalog(old, observed, today)
+    validate_transition(old, new, set(observed))
     changed = sorted(model for model, value in new["models"].items()
                      if value != old.get("models", {}).get(model))
     if new != old:
         print("Updated models: " + ", ".join(changed) if changed else "Refreshed price verification date")
-        if not args.dry_run:
-            CATALOG.write_text(json.dumps(new, ensure_ascii=False, indent=2) + "\n")
     else:
         print("No price changes")
+    if not args.dry_run and (new != old or args.output != CATALOG):
+        catalog.atomic_write(args.output, (json.dumps(new, ensure_ascii=False, indent=2) + "\n").encode())
     return 0
 
 
