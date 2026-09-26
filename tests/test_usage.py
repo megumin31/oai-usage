@@ -13,6 +13,7 @@ import unittest
 from unittest.mock import patch
 
 SCRIPT = Path(__file__).resolve().parents[1] / 'oai-usage'
+os.environ.setdefault('OAI_USAGE_OFFLINE_PRICES', '1')
 M = runpy.run_path(str(SCRIPT), run_name='usage_tests')
 G = M['main'].__globals__
 U = M['Usage']
@@ -197,6 +198,18 @@ class Fixtures(unittest.TestCase):
         self.assertIsNot(cache.rows, original_rows)
         self.assertEqual(cache.rows[0][0].usage.total_tokens, 200)
 
+    def test_report_cache_reprices_when_catalog_changes(self):
+        self.write('a.jsonl', [meta(), context('gpt-6-sol'), token(100000, last=100000)])
+        scanner, cache = M['Scanner'](), M['ReportCache']()
+        prices = M['default_prices']()
+        cache.prepare(scanner, scanner.scan([self.root]), prices)
+        old_cost = cache.rows[0][1].amount
+        changed = dict(prices)
+        changed['gpt-6-sol'] = M['replace'](prices['gpt-6-sol'], input=M['Decimal']('3'))
+        cache.prepare(scanner, scanner.scan([self.root]), changed)
+        self.assertEqual(old_cost, M['Decimal']('.2'))
+        self.assertEqual(cache.rows[0][1].amount, M['Decimal']('.3'))
+
     def test_report_cache_invalidates_at_time_boundary(self):
         self.write('a.jsonl', [meta(), context(), token(100, 1, last=100), token(150, 2, last=50)])
         scanner, cache = M['Scanner'](), M['ReportCache']()
@@ -278,12 +291,55 @@ class Accounting(unittest.TestCase):
         self.assertEqual(result['known_api_cost_usd'], 0)
         self.assertEqual(result['unpriced_usage']['total_tokens'], 1000000)
 
+    @patch.dict(os.environ, {'OAI_USAGE_OFFLINE_PRICES': '0'})
+    def test_remote_price_catalog_and_offline_fallback(self):
+        raw = json.loads((SCRIPT.parent / 'prices.json').read_text())
+        raw['models']['gpt-6-sol']['input'] = '3.00'
+        data = json.dumps(raw).encode()
+        with tempfile.TemporaryDirectory() as root:
+            cache_path = Path(root) / 'prices.json'
+            with patch.dict(G, {'price_cache_path': lambda: cache_path}), \
+                 patch.object(M['urllib'].request, 'urlopen', return_value=io.BytesIO(data)):
+                live = M['load_price_catalog']()
+            self.assertEqual(live.origin, 'github')
+            self.assertEqual(live.prices['gpt-6-sol'].input, M['Decimal']('3.00'))
+            self.assertEqual(cache_path.read_bytes(), data)
+            with patch.dict(G, {'price_cache_path': lambda: cache_path}), \
+                 patch.object(M['urllib'].request, 'urlopen', side_effect=OSError('offline')):
+                cached = M['load_price_catalog']()
+            self.assertEqual(cached.origin, 'cache')
+            self.assertEqual(cached.prices['gpt-6-sol'].input, M['Decimal']('3.00'))
+            raw['models']['gpt-6-sol']['input'] = '-1'
+            with patch.dict(G, {'price_cache_path': lambda: cache_path}), \
+                 patch.object(M['urllib'].request, 'urlopen', return_value=io.BytesIO(json.dumps(raw).encode())):
+                rejected = M['load_price_catalog']()
+            self.assertEqual(rejected.origin, 'cache')
+            self.assertEqual(cache_path.read_bytes(), data)
+            old = json.loads(data)
+            old['verified_at'] = '2026-01-01'
+            cache_path.write_text(json.dumps(old))
+            with patch.dict(G, {'price_cache_path': lambda: cache_path}):
+                bundled = M['load_price_catalog'](offline=True)
+            self.assertEqual(bundled.origin, 'bundled')
+
     def test_long_context_per_request(self):
         prices = M['default_prices']()
         e = self.event(n=300000, out=1000, request=300000)
         self.assertEqual(M['charge'](e, prices).amount, M['Decimal']('6.075'))
         small = self.event(n=150000, out=500, request=150000)
         self.assertEqual(2 * M['charge'](small, prices).amount, M['Decimal']('3.05'))
+
+    def test_new_gpt6_models_include_cache_and_request_long_context(self):
+        prices = M['default_prices']()
+        for model, short_cost, long_cost in (
+            ('gpt-6-sol', '.179', '1.215'),
+            ('gpt-6-luna', '.00895', '.06075'),
+        ):
+            with self.subTest(model=model):
+                short = M['Event']('s', at(), model, U(100000, 20000, 10000, 1000, 0, 101000), 100000)
+                long = self.event(model, n=300000, out=1000, request=300000)
+                self.assertEqual(M['charge'](short, prices).amount, M['Decimal'](short_cost))
+                self.assertEqual(M['charge'](long, prices).amount, M['Decimal'](long_cost))
 
     def test_threshold_and_unknown_request(self):
         prices = M['default_prices']()
@@ -305,6 +361,10 @@ class Accounting(unittest.TestCase):
         prices = M['price_overrides'](['astra=2,.2,10,2.5'])
         e = self.event('gpt6_astra-2026-09-04', n=1000000, request=100000)
         self.assertEqual(M['charge'](e, prices).amount, M['Decimal']('2'))
+        repeated = M['price_overrides'](['gpt-6-sol=0,0,0,0', 'gpt-6-sol=3,.3,15'])
+        self.assertEqual(repeated['gpt-6-sol'].write, M['Decimal']('3.75'))
+        self.assertEqual(M['charge'](self.event('gpt-6-sol', n=300000, out=1000, request=300000),
+                                      repeated).amount, M['Decimal']('1.8225'))
         for value in ('x=nan,1,2', 'x=-1,0,2', 'x=1,inf,2', '=1,2,3', 'x=1,2', 'x=1e999,1,1'):
             with self.assertRaises(ValueError, msg=value):
                 M['price_overrides']([value])

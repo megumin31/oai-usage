@@ -20,6 +20,7 @@ import tempfile
 import threading
 import time
 import unicodedata
+import urllib.request
 from bisect import bisect_left
 from collections import Counter, defaultdict
 from dataclasses import asdict, dataclass, field, replace
@@ -33,7 +34,8 @@ VERSION = "0.0.1"
 UTC = timezone.utc
 FIELDS = ("input_tokens", "cached_input_tokens", "cache_write_input_tokens",
           "output_tokens", "reasoning_output_tokens", "total_tokens")
-PRICE_DATE = "2026-09-22"
+PRICE_URL = "https://raw.githubusercontent.com/megumin31/oai-usage/main/prices.json"
+PRICE_FILE = Path(__file__).resolve().with_name("prices.json")
 
 
 def timestamp(value: Any) -> Optional[datetime]:
@@ -432,29 +434,146 @@ class Price:
     cached: Decimal
     output: Decimal
     write: Optional[Decimal] = None
-    long_threshold: Optional[int] = 272000
+    long_threshold: Optional[int] = None
     long_scope: str = "request"
     source: str = "custom"
+    long_input: Optional[Decimal] = None
+    long_cached: Optional[Decimal] = None
+    long_write: Optional[Decimal] = None
+    long_output: Optional[Decimal] = None
+
+
+@dataclass(frozen=True)
+class PriceCatalog:
+    prices: dict
+    verified_at: str
+    origin: str
+
+
+def price_cache_path() -> Path:
+    base = Path(os.environ.get("XDG_CACHE_HOME", "~/.cache")).expanduser()
+    return base / "oai-usage" / "prices.json"
+
+
+def parse_price_catalog(raw: Any, origin: str) -> PriceCatalog:
+    if not isinstance(raw, dict) or raw.get("schema_version") != 1 or raw.get("basis") != "standard_api_equivalent":
+        raise ValueError("Invalid price catalog schema or basis")
+    verified_at = raw.get("verified_at")
+    try:
+        if not isinstance(verified_at, str) or date.fromisoformat(verified_at).isoformat() != verified_at:
+            raise ValueError()
+    except ValueError:
+        raise ValueError("Invalid price catalog verification date")
+    models = raw.get("models")
+    if not isinstance(models, dict) or not 1 <= len(models) <= 200:
+        raise ValueError("Invalid price catalog models")
+
+    def amount(value: Any, optional: bool = False) -> Optional[Decimal]:
+        if optional and value is None:
+            return None
+        if not isinstance(value, str):
+            raise ValueError("Invalid price catalog rate")
+        try:
+            number = Decimal(value)
+        except InvalidOperation:
+            raise ValueError("Invalid price catalog rate")
+        if not number.is_finite() or not 0 <= number <= Decimal("1e9"):
+            raise ValueError("Invalid price catalog rate")
+        return number
+
+    prices = {}
+    for model, row in models.items():
+        if (not isinstance(model, str) or not re.fullmatch(r"[a-z0-9][a-z0-9._-]{0,79}", model)
+                or model != canonical_model(model) or not isinstance(row, dict)):
+            raise ValueError("Invalid price catalog model")
+        source = row.get("source")
+        if not isinstance(source, str) or not re.fullmatch(
+                r"https://developers\.openai\.com/api/docs/(?:pricing|models/[a-z0-9][a-z0-9._-]*)", source):
+            raise ValueError("Invalid price catalog source")
+        long = row.get("long_context")
+        if long is None:
+            threshold, scope = None, "request"
+        elif isinstance(long, dict):
+            threshold, scope = long.get("threshold"), long.get("scope")
+            if isinstance(threshold, bool) or not isinstance(threshold, int) or not 0 < threshold <= 10_000_000 or scope not in ("request", "session"):
+                raise ValueError("Invalid price catalog long-context rule")
+            for key in ("input", "cached_input", "output"):
+                if key not in long:
+                    raise ValueError("Incomplete price catalog long-context rates")
+        else:
+            raise ValueError("Invalid price catalog long-context rule")
+        base_write = amount(row.get("cache_write"), True)
+        long_write = amount(long.get("cache_write"), True) if long is not None else None
+        if long is not None and (base_write is None) != (long_write is None):
+            raise ValueError("Inconsistent price catalog cache-write rates")
+        prices[model] = Price(amount(row.get("input")), amount(row.get("cached_input")),
+                              amount(row.get("output")), base_write, threshold, scope, source,
+                              amount(long.get("input")) if long is not None else None,
+                              amount(long.get("cached_input")) if long is not None else None,
+                              long_write, amount(long.get("output")) if long is not None else None)
+    return PriceCatalog(prices, verified_at, origin)
+
+
+def read_price_catalog(path: Path, origin: str) -> PriceCatalog:
+    return parse_price_catalog(json.loads(path.read_text(encoding="utf-8")), origin)
 
 
 def default_prices() -> dict:
-    result = {}
-    for model, values in {
-        "gpt-6-astra": ("10", "1", "50", "12.5"),
-        "gpt-5.6-sol": ("4", ".4", "20", "5"),
-        "gpt-5.6-terra": ("2", ".2", "12", "2.5"),
-        "gpt-5.6-luna": (".2", ".02", "1.2", ".25"),
-        "gpt-5.5": ("5", ".5", "30", None),
-        "gpt-5.4": ("2.5", ".25", "15", None),
-    }.items():
-        nums = [Decimal(x) if x is not None else None for x in values]
-        result[model] = Price(*nums, long_scope="session" if model in ("gpt-5.5", "gpt-5.4") else "request",
-                              source=f"https://developers.openai.com/api/docs/models/{model}")
-    return result
+    return read_price_catalog(PRICE_FILE, "bundled").prices
 
 
-def price_overrides(values: list) -> dict:
-    prices = default_prices()
+def cache_price_catalog(data: bytes) -> None:
+    path = price_cache_path()
+    if path.exists() and path.read_bytes() == data:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix=".prices-", dir=path.parent)
+    try:
+        with os.fdopen(fd, "wb") as stream:
+            stream.write(data)
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def load_price_catalog(offline: bool = False) -> PriceCatalog:
+    offline = offline or os.environ.get("OAI_USAGE_OFFLINE_PRICES") == "1"
+    available = []
+    for path, origin in ((price_cache_path(), "cache"), (PRICE_FILE, "bundled")):
+        try:
+            available.append(read_price_catalog(path, origin))
+        except (OSError, ValueError, UnicodeError):
+            continue
+    fallback = max(available, key=lambda catalog: catalog.verified_at) if available else None
+    if not offline:
+        try:
+            request = urllib.request.Request(PRICE_URL, headers={"User-Agent": "oai-usage/0.0.1"})
+            with urllib.request.urlopen(request, timeout=4) as response:
+                data = response.read(1_000_001)
+            if len(data) > 1_000_000:
+                raise ValueError("Remote price catalog is too large")
+            catalog = parse_price_catalog(json.loads(data.decode("utf-8")), "github")
+            if fallback is None or catalog.verified_at >= fallback.verified_at:
+                try:
+                    cache_price_catalog(data)
+                except OSError:
+                    pass  # A read-only cache must not discard valid remote prices.
+                return catalog
+        except (OSError, ValueError, UnicodeError):
+            pass
+    if fallback is not None:
+        return fallback
+    raise ValueError("No valid price catalog is available from GitHub, cache, or bundled prices.json")
+
+
+def price_overrides(values: list, base: Optional[dict] = None) -> dict:
+    original = dict(default_prices() if base is None else base)
+    prices = dict(original)
+    def scaled(new: Optional[Decimal], previous: Optional[Decimal], prior_long: Optional[Decimal]) -> Optional[Decimal]:
+        if new is None or previous is None or prior_long is None:
+            return None
+        return new * prior_long / previous if previous else Decimal(0)
     for spec in values:
         try:
             model, rates = spec.split("=", 1)
@@ -465,9 +584,15 @@ def price_overrides(values: list) -> dict:
         except (ValueError, InvalidOperation):
             raise ValueError(f"Invalid price {spec!r}; use MODEL=IN,CACHED,OUT[,WRITE] with finite, nonnegative rates")
         old = prices.get(model)
-        write = numbers[3] if len(numbers) == 4 else (numbers[0] * Decimal("1.25") if old and old.write is not None else None)
+        reference = original.get(model) or old
+        write = numbers[3] if len(numbers) == 4 else (
+            scaled(numbers[0], reference.input, reference.write) if reference else None)
         prices[model] = Price(*numbers[:3], write, old.long_threshold if old else None,
-                              old.long_scope if old else "request", "custom")
+                              old.long_scope if old else "request", "custom",
+                              scaled(numbers[0], reference.input, reference.long_input) if reference else None,
+                              scaled(numbers[1], reference.cached, reference.long_cached) if reference else None,
+                              scaled(write, reference.write, reference.long_write) if reference else None,
+                              scaled(numbers[2], reference.output, reference.long_output) if reference else None)
     return prices
 
 
@@ -487,12 +612,16 @@ def charge(event: Event, prices: dict, session_long: bool = False) -> Charge:
     long = session_long or bool(price.long_threshold and event.request_input is not None and event.request_input > price.long_threshold)
     if price.long_threshold and event.request_input is None and usage.input_tokens > price.long_threshold and not long:
         reasons.append("unknown_request_size")
-    if usage.cache_write_input_tokens and price.write is None:
+    input_rate = price.long_input if long else price.input
+    cached_rate = price.long_cached if long else price.cached
+    write_rate = price.long_write if long else price.write
+    output_rate = price.long_output if long else price.output
+    if usage.cache_write_input_tokens and write_rate is None:
         reasons.append("unknown_cache_write_price")
-    input_cost = usage.uncached * price.input + usage.cached_input_tokens * price.cached
-    if price.write is not None:
-        input_cost += usage.cache_write_input_tokens * price.write
-    amount = (input_cost * (2 if long else 1) + usage.output_tokens * price.output * (Decimal("1.5") if long else 1)) / 1000000
+    input_cost = usage.uncached * input_rate + usage.cached_input_tokens * cached_rate
+    if write_rate is not None:
+        input_cost += usage.cache_write_input_tokens * write_rate
+    amount = (input_cost + usage.output_tokens * output_rate) / 1000000
     return Charge(amount, not reasons, tuple(reasons))
 
 
@@ -899,6 +1028,7 @@ def bounds(args: argparse.Namespace, calendar: Calendar, now: datetime) -> tuple
 @dataclass
 class ReportCache:
     revision: int = -1
+    prices_key: tuple = ()
     sessions: list = field(default_factory=list)
     issues: Counter = field(default_factory=Counter)
     rows: list = field(default_factory=list)
@@ -907,11 +1037,13 @@ class ReportCache:
     summary: dict = field(default_factory=dict)
 
     def prepare(self, scanner: Scanner, rollouts: list, prices: dict) -> None:
-        if self.revision != scanner.revision:
+        prices_key = tuple(sorted(prices.items()))
+        if self.revision != scanner.revision or self.prices_key != prices_key:
             self.sessions, self.issues = account(rollouts)
             self.rows = priced_events(self.sessions, prices)
             self.times = sorted(e.at for e, _ in self.rows if e.at is not None)
             self.revision = scanner.revision
+            self.prices_key = prices_key
             self.summary_key = ()
 
     def summarize(self, calendar: Calendar, start: Optional[datetime], end: Optional[datetime], by: str) -> dict:
@@ -926,7 +1058,8 @@ class ReportCache:
 
 
 def report(args: argparse.Namespace, scanner: Scanner, prices: dict, calendar: Calendar,
-           roots: list, poller: Optional[QuotaPoller] = None, cache: Optional[ReportCache] = None) -> dict:
+           roots: list, poller: Optional[QuotaPoller] = None, cache: Optional[ReportCache] = None,
+           price_catalog: Optional[PriceCatalog] = None) -> dict:
     # For a one-shot live query, scan AFTER observing quota so the log cutoff can
     # include tokens already reflected in that quota snapshot.
     live = (None, None)
@@ -944,6 +1077,7 @@ def report(args: argparse.Namespace, scanner: Scanner, prices: dict, calendar: C
     current = quota_status(args.quota, rollouts, live, now, args.limit_id)
     summary["current_rate_limits"] = current
     summary["cycle_estimates"] = projections(rows, current, now)
+    price_catalog = price_catalog or read_price_catalog(PRICE_FILE, "bundled")
     return {"schema_version": 2, "version": VERSION, "generated_at": now.isoformat(),
             "period": {"start": start.isoformat() if start else None, "end": end.isoformat() if end else None,
                        "timezone": calendar.name, "end_exclusive": True},
@@ -951,11 +1085,17 @@ def report(args: argparse.Namespace, scanner: Scanner, prices: dict, calendar: C
             "projection_assumptions": ["Account usage primarily occurs on this machine", "Quota consumption is approximately proportional to local API-equivalent cost",
                 "Future model and cache mix remains similar", "Account percentages may be rounded", "Account ownership of log snapshots cannot be independently verified"],
             "pricing": {"basis": "standard_api_equivalent",
-                "verified_at": PRICE_DATE, "historical_price_schedule": False,
+                "verified_at": price_catalog.verified_at, "catalog_source": price_catalog.origin,
+                "historical_price_schedule": False,
                 "excluded": ["tools", "regional_uplift", "fast_or_priority_service", "subscription_billing"],
                 "models": {k: {"input": str(p.input), "cached_input": str(p.cached), "output": str(p.output),
                     "cache_write": str(p.write) if p.write is not None else None,
-                    "long_context_threshold": p.long_threshold, "long_context_scope": p.long_scope, "source": p.source}
+                    "long_context_threshold": p.long_threshold, "long_context_scope": p.long_scope,
+                    "long_input": str(p.long_input) if p.long_input is not None else None,
+                    "long_cached_input": str(p.long_cached) if p.long_cached is not None else None,
+                    "long_cache_write": str(p.long_write) if p.long_write is not None else None,
+                    "long_output": str(p.long_output) if p.long_output is not None else None,
+                    "source": p.source}
                     for k, p in sorted(prices.items())}},
             "diagnostics": {"files": len(rollouts), "issues": dict(sorted(issues.items())),
                             "bytes_read_this_process": scanner.bytes_read},
@@ -1324,6 +1464,7 @@ def parse_args(argv: Optional[list] = None) -> argparse.Namespace:
         p.add_argument("--codex-binary", help="Path to the Codex executable")
         p.add_argument("--timeout", "--limits-timeout", type=positive, default=10, help="Live quota timeout in seconds (default: 10)")
         p.add_argument("--price", action="append", default=[], metavar="MODEL=IN,CACHED,OUT[,WRITE]", help="Custom USD rates per million tokens")
+        p.add_argument("--offline-prices", action="store_true", help="Use cached or bundled prices without checking GitHub")
         p.add_argument("--json", action="store_true", help="Only print JSON to stdout; watch emits one JSON document per line")
         p.add_argument("--output", "--json-out", help="Atomically save the full JSON report; - for stdout")
         color = p.add_mutually_exclusive_group()
@@ -1334,6 +1475,7 @@ def parse_args(argv: Optional[list] = None) -> argparse.Namespace:
         p.add_argument("--count", type=int, default=0, help="Exit watch after N refreshes; 0 to keep running")
     p = sub.add_parser("prices", help="Show built-in prices and official sources")
     p.add_argument("--json", action="store_true")
+    p.add_argument("--offline-prices", action="store_true")
     parsed = parser.parse_args(args)
     if parsed.command != "prices":
         try:
@@ -1343,7 +1485,7 @@ def parse_args(argv: Optional[list] = None) -> argparse.Namespace:
                 raise ValueError("--today cannot be combined with --until")
             calendar = Calendar.make(parsed.timezone)
             bounds(parsed, calendar, datetime.now(UTC))
-            price_overrides(parsed.price)
+            price_overrides(parsed.price, {})
         except (ValueError, OverflowError, ZoneInfoNotFoundError) as exc:
             parser.error(f"Invalid date, timezone, or price option: {exc}")
     return parsed
@@ -1351,23 +1493,36 @@ def parse_args(argv: Optional[list] = None) -> argparse.Namespace:
 
 def main(argv: Optional[list] = None) -> int:
     args = parse_args(argv)
+    try:
+        price_catalog = load_price_catalog(args.offline_prices)
+    except (OSError, ValueError) as exc:
+        print(f"oai-usage: {exc}", file=sys.stderr)
+        return 1
     if args.command == "prices":
         rows = [{"model": model, "input": str(p.input), "cached": str(p.cached), "output": str(p.output),
                  "cache_write": str(p.write) if p.write is not None else None, "source": p.source,
-                 "long_context_threshold": p.long_threshold, "long_context_scope": p.long_scope}
-                for model, p in default_prices().items()]
+                 "long_context_threshold": p.long_threshold, "long_context_scope": p.long_scope,
+                 "long_input": str(p.long_input) if p.long_input is not None else None,
+                 "long_cached_input": str(p.long_cached) if p.long_cached is not None else None,
+                 "long_cache_write": str(p.long_write) if p.long_write is not None else None,
+                 "long_output": str(p.long_output) if p.long_output is not None else None}
+                for model, p in price_catalog.prices.items()]
         if args.json:
-            print(json.dumps({"verified_at": PRICE_DATE, "prices": rows}, ensure_ascii=False, indent=2))
+            print(json.dumps({"verified_at": price_catalog.verified_at,
+                              "catalog_source": price_catalog.origin, "prices": rows}, ensure_ascii=False, indent=2))
         else:
-            print(f"Standard API prices · USD / 1M tokens · Verified {PRICE_DATE}")
+            print(f"Standard API prices · USD / 1M tokens · Verified {price_catalog.verified_at} · {price_catalog.origin}")
             print("\n".join(table(["Model", "Input", "Cached", "Output", "Write"],
                 [[r['model'], r['input'], r['cached'], r['output'], r['cache_write'] or '-'] for r in rows])))
-            print("\nLong context above 272K: input/cache 2x, output 1.5x; 5.4/5.5 per session, others per request.")
+            print("\nLong-context prices apply above each model's listed input-token threshold.")
             for r in rows:
-                print(f"{r['model']}: {r['source']}")
+                rule = (f" · >{r['long_context_threshold']:,} per {r['long_context_scope']}: "
+                        f"input {r['long_input']}, cached {r['long_cached_input']}, "
+                        f"write {r['long_cache_write'] or '-'}, output {r['long_output']}") if r['long_context_threshold'] else ""
+                print(f"{r['model']}{rule}: {r['source']}")
         return 0
     calendar = Calendar.make(args.timezone)
-    prices = price_overrides(args.price)
+    prices = price_overrides(args.price, price_catalog.prices)
     codex_home = Path(os.environ.get("CODEX_HOME", "~/.codex")).expanduser()
     roots = [Path(r).expanduser().resolve() for r in args.root] if args.root else [codex_home / "sessions", codex_home / "archived_sessions"]
     json_stdout = args.json or args.output == "-"
@@ -1382,11 +1537,18 @@ def main(argv: Optional[list] = None) -> int:
             poller = QuotaPoller(args.codex_binary, args.timeout, args.quota_interval)
             poller.start()
         count = 0
+        next_price_refresh = time.monotonic() + 3600
         while True:
             tick = time.monotonic()
-            data = report(args, scanner, prices, calendar, roots, poller, cache)
+            if args.command == "watch" and tick >= next_price_refresh:
+                refreshed = load_price_catalog(args.offline_prices)
+                if refreshed.verified_at >= price_catalog.verified_at:
+                    price_catalog = refreshed
+                    prices = price_overrides(args.price, price_catalog.prices)
+                next_price_refresh = tick + 3600
+            data = report(args, scanner, prices, calendar, roots, poller, cache, price_catalog)
             if args.output and args.output != "-":
-                protected = {Path(__file__).resolve()} | set(scanner.cache)
+                protected = {Path(__file__).resolve(), PRICE_FILE, price_cache_path()} | set(scanner.cache)
                 write_json(Path(args.output), data, protected)
             if json_stdout:
                 print(json.dumps(data, ensure_ascii=False, allow_nan=False,

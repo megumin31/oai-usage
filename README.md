@@ -1,10 +1,10 @@
 # oai-usage
 
-`oai-usage` 是一个本地运行的单文件命令行工具，用于汇总 Codex session 日志中的 token 用量、按当前公开 Standard API 单价计算等价成本，并显示账户额度信息。
+`oai-usage` 是一个本地运行的命令行工具，用于汇总 Codex session 日志中的 token 用量、按当前公开 Standard API 单价计算等价成本，并显示账户额度信息。
 
 - Python 3.9+；只使用标准库，无需安装第三方依赖。
 - 原始 JSONL 日志只读；工具不保留会话正文，不上传日志，也不会读取凭据内容或消耗额度重置次数。
-- 脚本文件为 [`oai-usage`](./oai-usage)。当前版本为 0.0.1；程序提供的 CLI、报告、诊断和 JSON 说明文字使用英文，日志中的模型名等用户数据保持原样。
+- 脚本文件为 [`oai-usage`](./oai-usage)，随附的 [`prices.json`](./prices.json) 是首次离线可用的价格表。当前版本为 0.0.1；程序提供的 CLI、报告、诊断和 JSON 说明文字使用英文，日志中的模型名等用户数据保持原样。
 
 ## 快速开始
 
@@ -40,8 +40,11 @@
 ./oai-usage watch
 ./oai-usage watch --quota off --refresh 5 --count 3
 
-# 查看内置价格和来源
+# 查看当前价格表和来源
 ./oai-usage prices
+
+# 不访问 GitHub，使用本机缓存或随附价格表
+./oai-usage prices --offline-prices
 ```
 
 `report` 是默认子命令，因此 `./oai-usage --today` 等同于 `./oai-usage report --today`。使用 `./oai-usage report --help`、`./oai-usage watch --help` 或 `./oai-usage prices --help` 查看完整参数。
@@ -54,6 +57,7 @@
 
 ```sh
 install -m 755 ./oai-usage ~/.local/bin/oai-usage
+install -m 644 ./prices.json ~/.local/bin/prices.json
 oai-usage --version
 ```
 
@@ -77,7 +81,11 @@ python3 -m unittest discover -s tests -q
 
 ## 成本、价格与额度
 
-报告中的“API 等价成本”是按当前公开的 Standard API 单价换算的估计，**不是历史账单，也不是订阅账单**。内置价格在 2026-09-22 核对；运行 `prices` 可查看模型价格、长上下文规则和官方来源。
+报告中的“API 等价成本”是按当前公开的 Standard API 单价换算的估计，**不是历史账单，也不是订阅账单**。价格表由仓库中的 [`prices.json`](./prices.json) 提供；运行 `prices` 可查看模型价格、长上下文规则、最近核对日期和当前目录来源。
+
+每次启动 `report`、`watch` 或 `prices` 时，工具会从公开仓库的 `main/prices.json` 查询有效的价格表，并缓存到 `$XDG_CACHE_HOME/oai-usage/prices.json`（未设置时为 `~/.cache/oai-usage/prices.json`）。远端不可用或数据校验失败时，工具在本机缓存和脚本同目录的 `prices.json` 中选择 `verified_at` 较新的有效版本。`watch` 会每小时重新查询并按新价格重新计价。
+
+使用 `--offline-prices` 或设置 `OAI_USAGE_OFFLINE_PRICES=1` 可禁止远端查询，此时仍按上述顺序使用本机缓存和随附价格表。`--price` 指定的手动单价优先于价格表。
 
 该估算不包括工具费用、地区加价、Fast/优先服务或订阅费用。成本按用量事件计费，并以 `Decimal` 计算；已知模型的长上下文规则按模型适用的请求或 session 级范围处理。可以覆盖单价：
 
@@ -86,6 +94,8 @@ python3 -m unittest discover -s tests -q
 ```
 
 参数格式为 `MODEL=IN,CACHED,OUT[,WRITE]`；四项都是每百万 tokens 的美元单价，`WRITE` 可选，所有值必须是有限的非负数。已知模型别名会统一解析，相关长上下文规则仍然生效。
+
+仓库的 GitHub Actions 每日 03:17 UTC 以及手动触发时，从 OpenAI 官方定价页读取 Standard 价格，并从模型页读取长上下文阈值和请求或 session 范围。只有解析和测试均成功、且价格表确有变化时，工作流才会更新 `main` 分支中的 `prices.json`。该同步仅覆盖具备输入、缓存输入和输出单价的 GPT 模型；校验失败不会写入价格表。
 
 未知模型不会套用其他模型的价格。请求大小无法确定、而价格可能因长上下文阈值变化时，成本也会标记为不完整。因此：
 
@@ -114,7 +124,7 @@ python3 -m unittest discover -s tests -q
 
 持续刷新时，`ReportCache` 会复用未变化日志的会话、计价和汇总结果；滑动时间窗口只有跨过用量事件边界时才重新汇总。
 
-顶层 JSON 的 `schema_version` 为 `2`，包含 `version`、`generated_at`、`period`、`roots`、`pricing`、`diagnostics`、`summary` 和 `sessions`。`summary` 保留常用的 `usage`、`by_model`、`by_day`、`by_session`、`unpriced_usage` 与 `api_cost_usd` 语义，并新增 `known_api_cost_usd`、`estimate_is_partial`、`uncertain_pricing_usage`、`pricing_issues`；每个 session 可包含 `parent_session_id`。JSON 字段和数值计价逻辑保持 schema v2 兼容，说明文字改为英文；旧 JSON 使用者应按 schema v2 升级解析。
+顶层 JSON 的 `schema_version` 为 `2`，包含 `version`、`generated_at`、`period`、`roots`、`pricing`、`diagnostics`、`summary` 和 `sessions`。`pricing` 包含价格表的 `verified_at`、`catalog_source`（`github`、`cache` 或 `bundled`），以及每个模型的普通和长上下文单价；长上下文字段为 `long_input`、`long_cached_input`、`long_cache_write` 和 `long_output`。`prices --json` 同样返回 `verified_at`、`catalog_source` 和这些每模型价格字段。`summary` 保留常用的 `usage`、`by_model`、`by_day`、`by_session`、`unpriced_usage` 与 `api_cost_usd` 语义，并新增 `known_api_cost_usd`、`estimate_is_partial`、`uncertain_pricing_usage`、`pricing_issues`；每个 session 可包含 `parent_session_id`。JSON 字段和数值计价逻辑保持 schema v2 兼容，说明文字改为英文；旧 JSON 使用者应按 schema v2 升级解析。
 
 下列旧参数仍可用作别名：
 

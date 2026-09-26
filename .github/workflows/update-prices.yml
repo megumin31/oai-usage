@@ -1,0 +1,41 @@
+name: Update OpenAI prices
+
+on:
+  schedule:
+    - cron: '17 3 * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: update-prices
+  cancel-in-progress: false
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.9'
+      - name: Read and validate official Standard prices
+        run: python3 scripts/update_prices.py
+      - name: Verify calculator and price sync
+        run: python3 -m unittest discover -s tests -q
+        env:
+          OAI_USAGE_OFFLINE_PRICES: '1'
+      - name: Commit changed price catalog
+        run: |
+          if git diff --quiet -- prices.json; then
+            echo 'Price catalog unchanged'
+            exit 0
+          fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add -- prices.json
+          git commit -m 'Update OpenAI Standard prices'
+          git push origin HEAD:main
