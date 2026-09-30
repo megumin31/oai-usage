@@ -59,9 +59,7 @@ jobs:
         with:
           name: price-candidate
           path: candidate
-      - name: Revalidate candidate using trusted code
-        run: python3 scripts/update_prices.py --validate candidate/prices.json
-      - name: Publish only prices.json if main still matches this run
+      - name: Validate and publish only prices.json if main still matches this run
         run: python3 scripts/publish_prices.py
         env:
           GH_TOKEN: ${{ github.token }}

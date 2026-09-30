@@ -7,10 +7,9 @@ import re
 import subprocess
 import sys
 import tempfile
-import urllib.error
 import urllib.request
 from dataclasses import dataclass, replace
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, timezone
 from decimal import Decimal
 from http.client import HTTPException
 from pathlib import Path
@@ -274,10 +273,6 @@ def catalog_info(catalog: PriceCatalog) -> dict:
             "price_source": catalog.source, "model_source": catalog.model_source}
 
 
-def read_price_catalog(path: Path, origin: str) -> PriceCatalog:
-    return parse_price_catalog(strict_json(read_limited(path)), origin)
-
-
 def load_price_catalog() -> PriceCatalog:
     try:
         data = fetch_https(PRICE_URL)
@@ -285,10 +280,6 @@ def load_price_catalog() -> PriceCatalog:
     except (OSError, ValueError, HTTPException, RecursionError) as exc:
         raise ValueError("Unable to load prices from GitHub; check your network and retry.") from exc
     return replace(catalog, fetched_at=datetime.now(UTC).isoformat())
-
-
-def default_prices() -> dict:
-    return load_price_catalog().prices
 
 
 def download_main() -> None:

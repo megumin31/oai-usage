@@ -2,7 +2,6 @@ import copy
 import io
 import json
 import os
-import runpy
 import tempfile
 import time
 import unittest
@@ -98,7 +97,6 @@ class CatalogSecurity(unittest.TestCase):
         for error in (IncompleteRead(b'partial', 20), prices.DownloadError('timeout'), OSError('offline')):
             with self.subTest(error=type(error).__name__), \
                     patch.object(prices, 'fetch_https', side_effect=error), \
-                    patch.object(prices, 'read_price_catalog', side_effect=AssertionError('No disk fallback')), \
                     self.assertRaisesRegex(ValueError, 'Unable to load prices'):
                 prices.load_price_catalog()
 
