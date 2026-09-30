@@ -16,7 +16,6 @@ sys.path.insert(0, str(ROOT))
 import oai_price_catalog as catalog
 
 CATALOG = ROOT / "prices.json"
-RULES = ROOT / "scripts" / "pricing_rules.json"
 MODELS_URL = catalog.MODEL_LIST_URL + ".md"
 PRICES_URL = catalog.MODELS_DEV_URL
 MODEL_URL = "https://developers.openai.com/api/docs/models/{}"
@@ -27,7 +26,7 @@ COST_FIELDS = {"input", "output", "cache_read", "cache_write", "tiers", "context
 
 
 class UnsupportedPrice(ValueError):
-    """A discovered model needs a reviewed rule before it can be priced."""
+    """The upstream model cannot be represented by token pricing."""
 
 
 def supported_id(model: str) -> bool:
@@ -57,20 +56,6 @@ def upstream_models(data: bytes) -> dict:
     return models
 
 
-def load_rules() -> dict:
-    raw = catalog.strict_json(catalog.read_limited(RULES))
-    catalog.exact_keys(raw, {"schema_version", "models"})
-    if type(raw["schema_version"]) is not int or raw["schema_version"] != 1 or not isinstance(raw["models"], dict):
-        raise ValueError("Invalid local pricing rules")
-    for model, rule in raw["models"].items():
-        catalog.exact_keys(rule, {"threshold", "scope", "source"})
-        if (not supported_id(model) or type(rule["threshold"]) is not int or
-                not 0 < rule["threshold"] <= 10_000_000 or rule["scope"] not in ("request", "session") or
-                rule["source"] != MODEL_URL.format(model)):
-            raise ValueError("Invalid local long-context rule")
-    return raw["models"]
-
-
 def rate(value) -> str:
     if type(value) not in (int, Decimal):
         raise ValueError("Upstream price must be a JSON number")
@@ -81,13 +66,13 @@ def rate(value) -> str:
 
 
 def rates(cost: dict) -> dict:
-    if any(cost.get(field) is None for field in ("input", "cache_read", "output")):
-        raise UnsupportedPrice("input, cached-input, or output price is unavailable")
+    if any(cost.get(field) is None for field in ("input", "output")):
+        raise UnsupportedPrice("input or output price is unavailable")
     return {target: rate(cost[field]) if cost.get(field) is not None else None
             for target, field in RATE_FIELDS.items()}
 
 
-def model_price(model: str, row: dict, rules: dict) -> dict:
+def model_price(model: str, row: dict) -> dict:
     if not isinstance(row, dict) or row.get("id") != model:
         raise ValueError("models.dev OpenAI model ID does not match its key")
     modalities = row.get("modalities", {})
@@ -104,10 +89,9 @@ def model_price(model: str, row: dict, rules: dict) -> dict:
     tiers = cost.get("tiers", [])
     if not isinstance(tiers, list):
         raise ValueError("Invalid price tiers")
-    rule = rules.get(model)
     long = None
     if not tiers:
-        if rule or "context_over_200k" in cost:
+        if "context_over_200k" in cost:
             raise UnsupportedPrice("explicit context tier is required")
     else:
         if len(tiers) != 1:
@@ -121,17 +105,13 @@ def model_price(model: str, row: dict, rules: dict) -> dict:
         threshold = metadata["size"]
         if type(threshold) is not int or not 0 < threshold <= 10_000_000:
             raise ValueError("Invalid context-tier threshold")
-        if rule is None:
-            raise UnsupportedPrice("long-context request/session rule needs official review in scripts/pricing_rules.json")
-        if threshold != rule["threshold"]:
-            raise ValueError(f"Review required: changed long-context threshold for {model}")
-        long = {**rates(tier), **rule}
+        long = {**rates(tier), "threshold": threshold, "scope": "request", "source": PRICES_URL}
         if (base["cache_write"] is None) != (long["cache_write"] is None):
             raise ValueError("Inconsistent cache-write tier prices")
     return {**base, "long_context": long, "source": PRICES_URL, "model_source": MODEL_URL.format(model)}
 
 
-def collect(markdown: str, data: bytes, rules: dict, warnings: Optional[list[str]] = None) -> dict[str, dict]:
+def collect(markdown: str, data: bytes, warnings: Optional[list[str]] = None) -> dict[str, dict]:
     official = official_models(markdown)
     upstream = upstream_models(data)
     warnings = warnings if warnings is not None else []
@@ -144,14 +124,14 @@ def collect(markdown: str, data: bytes, rules: dict, warnings: Optional[list[str
             warnings.append(f"Pending {model}: no matching OpenAI price in models.dev.")
             continue
         try:
-            models[model] = model_price(model, upstream[model], rules)
+            models[model] = model_price(model, upstream[model])
         except UnsupportedPrice as exc:
             warnings.append(f"Pending {model}: {exc}.")
     for model in sorted(upstream):
         if supported_id(model) and model not in official:
             warnings.append(f"Skipped {model}: not listed in the official model directory.")
     if not models:
-        raise ValueError("No supported OpenAI models have complete prices and rules")
+        raise ValueError("No supported OpenAI models have valid token prices")
     return models
 
 
@@ -180,27 +160,26 @@ def validate_transition(old: dict, new: dict, observed: Optional[set] = None) ->
             raise ValueError("Review required: at least 25% of known models disappeared")
         if missing and new["verified_at"] != old["verified_at"]:
             raise ValueError("Unobserved prices cannot receive a fresh check date")
-    rules = load_rules()
     rate_fields = ("input", "cached", "write", "output", "long_input", "long_cached", "long_write", "long_output")
     for model, price in incoming.prices.items():
         if not supported_id(model):
             raise ValueError("Unsupported model in OpenAI price catalog")
-        if price.long_threshold:
-            rule = rules.get(model)
-            if rule is None or (price.long_threshold, price.long_scope, price.rule_source) != (rule["threshold"], rule["scope"], rule["source"]):
-                raise ValueError(f"Review required: missing or conflicting local rule for {model}")
         prior = previous.prices.get(model)
         if prior is None:
             if any(getattr(price, name) == 0 for name in rate_fields):
                 raise ValueError(f"Review required: zero price for new model {model}")
             continue
-        if (price.long_threshold, price.long_scope) != (prior.long_threshold, prior.long_scope):
-            raise ValueError(f"Review required: changed long-context rules for {model}")
+        if price.long_threshold != prior.long_threshold:
+            raise ValueError(f"Review required: changed long-context threshold for {model}")
         for name in rate_fields:
             before, after = getattr(prior, name), getattr(price, name)
-            if (before is None) != (after is None):
-                raise ValueError(f"Review required: changed availability of {model} {name} price")
-            if before is None or before == after:
+            if before is None:
+                if after == 0:
+                    raise ValueError(f"Review required: zero price for newly priced {model} {name}")
+                continue
+            if after is None:
+                raise ValueError(f"Review required: lost {model} {name} price")
+            if before == after:
                 continue
             if before == 0 or after == 0 or after > before * 3 or after * 3 < before:
                 raise ValueError(f"Review required: unexpected change to {model} {name} price")
@@ -219,7 +198,7 @@ def main() -> int:
         print("Price candidate is valid")
         return 0
     warnings = []
-    observed = collect(fetch(MODELS_URL).decode("utf-8"), fetch(PRICES_URL), load_rules(), warnings)
+    observed = collect(fetch(MODELS_URL).decode("utf-8"), fetch(PRICES_URL), warnings)
     missing = old["models"].keys() - observed.keys()
     if missing:
         warnings.append("Retained unchecked models; source-check date will not advance: " + ", ".join(sorted(missing)))

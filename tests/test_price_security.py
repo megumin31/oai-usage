@@ -28,170 +28,92 @@ def encoded(raw):
 
 
 class CatalogSecurity(unittest.TestCase):
-    def setUp(self):
-        self.temp = tempfile.TemporaryDirectory()
-        self.addCleanup(self.temp.cleanup)
-        self.root = Path(self.temp.name)
-        self.cache = self.root / 'cache/prices.json'
-        self.bundle = self.root / 'prices.json'
-        self.raw = sample()
-        self.bundle.write_bytes(encoded(self.raw))
-        for context in (patch.object(prices, 'price_cache_path', return_value=self.cache),
-                        patch.object(prices, 'PRICE_FILE', self.bundle),
-                        patch.dict(os.environ, {'OAI_USAGE_OFFLINE_PRICES': '0'})):
-            context.start()
-            self.addCleanup(context.stop)
-
     def load(self, raw):
         with patch.object(prices, 'fetch_https', return_value=encoded(raw)):
             return prices.load_price_catalog()
 
-    def test_real_bundled_catalog_meets_schema_without_fixed_prices(self):
-        actual = Path(prices.__file__).with_name('prices.json')
-        catalog = prices.parse_price_catalog(prices.strict_json(prices.read_limited(actual)), 'bundled')
-        self.assertTrue(catalog.prices)
+    def test_legacy_session_scope_is_normalized_and_upstream_tier_source_is_valid(self):
+        raw = sample()
+        self.assertEqual(raw['models']['gpt-5.5']['long_context']['scope'], 'session')
+        result = self.load(raw)
+        self.assertEqual(result.prices['gpt-5.5'].long_scope, 'request')
+        raw['models']['gpt-5.5']['long_context']['source'] = prices.MODELS_DEV_URL
+        self.assertEqual(self.load(raw).prices['gpt-5.5'].rule_source, prices.MODELS_DEV_URL)
 
-    def test_current_provenance_and_cache_rotation(self):
-        new = copy.deepcopy(self.raw)
-        new['models']['gpt-6-sol']['input'] = '3'
-        self.load(self.raw)
-        result = self.load(new)
-        self.assertEqual(result.origin, 'github')
-        self.assertEqual(result.prices['gpt-6-sol'].source, prices.MODELS_DEV_URL)
-        self.assertEqual(prices.catalog_info(result)['model_source'], prices.MODEL_LIST_URL)
-        self.assertTrue(prices.previous_cache_path().exists())
-        for target, key, value in (
-            (new, 'provider', 'anthropic'), (new, 'source', 'https://evil.test/api.json'),
-            (new['models']['gpt-6-sol'], 'model_source', None),
-            (new['models']['gpt-6-sol'], 'model_source', 'https://developers.openai.com/api/docs/models/other'),
-            (new['models']['gpt-6-sol']['long_context'], 'source', prices.MODELS_DEV_URL),
-            (new['models']['gpt-6-sol']['long_context'], 'source', None),
-        ):
+    def test_optional_cache_read_prices_are_preserved_as_unknown(self):
+        raw = sample()
+        row = raw['models']['gpt-6-sol']
+        row['cached_input'] = None
+        row['long_context']['cached_input'] = None
+        price = self.load(raw).prices['gpt-6-sol']
+        self.assertIsNone(price.cached)
+        self.assertIsNone(price.long_cached)
+
+    def test_live_catalog_provenance_and_no_price_writes(self):
+        raw = sample()
+        with patch.object(prices, 'atomic_write', side_effect=AssertionError('Must not write prices')), \
+                tempfile.TemporaryDirectory() as directory, \
+                patch.dict(os.environ, {'XDG_CACHE_HOME': directory, 'OAI_USAGE_OFFLINE_PRICES': '1'}):
+            result = self.load(raw)
+            self.assertEqual(result.origin, 'github')
+            self.assertIsNotNone(result.fetched_at)
+            self.assertEqual(result.prices['gpt-6-sol'].source, prices.MODELS_DEV_URL)
+            self.assertEqual(prices.catalog_info(result)['model_source'], prices.MODEL_LIST_URL)
+            self.assertEqual(list(Path(directory).iterdir()), [])
+
+    def test_old_schema_and_invalid_provenance_are_rejected(self):
+        raw = sample()
+        for key, value in (('schema_version', 1), ('provider', 'anthropic'),
+                           ('source', 'https://evil.test/api.json'), ('model_source', None)):
+            bad = copy.deepcopy(raw)
+            bad[key] = value
+            with self.subTest(key=key), self.assertRaisesRegex(ValueError, 'Unable to load prices'):
+                self.load(bad)
+        row = raw['models']['gpt-6-sol']
+        for target, key, value in ((row, 'model_source', 'https://developers.openai.com/api/docs/models/other'),
+                                  (row['long_context'], 'source', 'https://evil.test/api.json')):
             before = target[key]
             target[key] = value
-            with self.subTest(key=key, value=value), self.assertRaises(ValueError):
-                prices.parse_price_catalog(new, 'candidate')
+            with self.subTest(key=key), self.assertRaises(ValueError):
+                self.load(raw)
             target[key] = before
-        # Upstream JSON numbers are enabled only in the CI adapter, not client data.
-        new['models']['gpt-6-sol']['input'] = 2.5
-        with self.assertRaises(ValueError):
-            prices.strict_json(encoded(new))
-
-    def test_old_schema_remote_and_cache_are_rejected(self):
-        old = copy.deepcopy(self.raw)
-        old['schema_version'] = 1
-        with self.assertRaisesRegex(ValueError, 'schema'):
-            prices.parse_price_catalog(old, 'old')
-        self.assertEqual(self.load(old).origin, 'bundled')
-        self.assertFalse(self.cache.exists())
-        self.load(self.raw)
-        envelope = json.loads(self.cache.read_text())
-        envelope['catalog'] = old
-        self.cache.write_bytes(encoded(envelope))
-        self.assertEqual(prices.load_price_catalog(offline=True).origin, 'bundled')
 
     def test_rejects_future_dates_duplicate_keys_nesting_and_bad_numbers(self):
-        bad = copy.deepcopy(self.raw)
+        bad = sample()
         bad['verified_at'] = '9999-12-31'
-        nested = b'{"unused":' + b'[' * 1100 + b'0' + b']' * 1100 + b'}'
-        values = [encoded(bad), nested, b'{"a":1,"a":2}', b'{"a":NaN}', b'{"a":1.2}',
+        values = [encoded(bad), b'[' * 1100, b'{"a":1,"a":2}', b'{"a":NaN}', b'{"a":1.2}',
                   b'{"a":' + b'9' * 1000 + b'}', b'{"a":"' + b'x' * 5000 + b'"}',
                   b'x' * (prices.MAX_BYTES + 1)]
         for value in values:
-            with self.subTest(size=len(value)), patch.object(prices, 'fetch_https', return_value=value):
-                result = prices.load_price_catalog()
-                self.assertEqual(result.origin, 'bundled')
-                self.assertTrue(result.warnings)
-                self.assertFalse(self.cache.exists())
+            with self.subTest(size=len(value)), patch.object(prices, 'fetch_https', return_value=value), \
+                    self.assertRaisesRegex(ValueError, 'Unable to load prices'):
+                prices.load_price_catalog()
         for rate in ('NaN', 'Infinity', '-1', '1e-999999', '1' * 100):
-            bad = copy.deepcopy(self.raw)
+            bad = sample()
             bad['models']['gpt-6-sol']['input'] = rate
             with self.subTest(rate=rate), self.assertRaises(ValueError):
-                prices.parse_price_catalog(bad, 'candidate')
+                self.load(bad)
 
-    def test_valid_remote_replaces_newer_cache_and_recovers_poisoned_cache(self):
-        self.load(self.raw)
-        correction = copy.deepcopy(self.raw)
-        correction['verified_at'] = (datetime.now(prices.UTC).date() - timedelta(days=2)).isoformat()
-        correction['models']['gpt-6-sol']['input'] = '3'
-        result = self.load(correction)
-        self.assertEqual(result.origin, 'github')
-        self.assertEqual(result.prices['gpt-6-sol'].input, 3)
-        self.assertIsNotNone(result.fetched_at)
-        envelope = json.loads(self.cache.read_text())
-        self.assertEqual(envelope['catalog'], correction)
-        self.assertEqual(envelope['fetched_at'], result.fetched_at)
-        poisoned = copy.deepcopy(self.raw)
-        poisoned['verified_at'] = '9999-12-31'
-        self.cache.write_bytes(encoded(poisoned))
-        self.assertEqual(self.load(self.raw).origin, 'github')
-
-    def test_tomorrows_verification_date_preserves_valid_cache(self):
-        self.load(self.raw)
-        before = self.cache.read_bytes()
-        tomorrow = copy.deepcopy(self.raw)
-        tomorrow['verified_at'] = (datetime.now(prices.UTC).date() + timedelta(days=1)).isoformat()
-        self.assertEqual(self.load(tomorrow).origin, 'cache')
-        self.assertEqual(self.cache.read_bytes(), before)
-
-    def test_invalid_response_preserves_cache_and_transport_failure_falls_back(self):
-        self.load(self.raw)
-        before = self.cache.read_bytes()
+    def test_transport_failure_does_not_use_local_prices(self):
         for error in (IncompleteRead(b'partial', 20), prices.DownloadError('timeout'), OSError('offline')):
-            with self.subTest(error=type(error).__name__), patch.object(prices, 'fetch_https', side_effect=error):
-                self.assertEqual(prices.load_price_catalog().origin, 'cache')
-                self.assertEqual(self.cache.read_bytes(), before)
-        with patch.object(prices, 'fetch_https', return_value=b'[' * 1100):
-            self.assertEqual(prices.load_price_catalog().origin, 'cache')
-            self.assertEqual(self.cache.read_bytes(), before)
+            with self.subTest(error=type(error).__name__), \
+                    patch.object(prices, 'fetch_https', side_effect=error), \
+                    patch.object(prices, 'read_price_catalog', side_effect=AssertionError('No disk fallback')), \
+                    self.assertRaisesRegex(ValueError, 'Unable to load prices'):
+                prices.load_price_catalog()
 
-    def test_previous_cache_offline_bundle_and_reset(self):
-        self.load(self.raw)
-        newer = copy.deepcopy(self.raw)
-        newer['models']['gpt-6-sol']['input'] = '3'
-        self.load(newer)
-        self.assertTrue(prices.previous_cache_path().exists())
-        self.cache.write_bytes(b'bad data')
-        with patch.object(prices, 'fetch_https', side_effect=AssertionError('Must stay offline')):
-            restored = prices.load_price_catalog(offline=True)
-            self.assertEqual(restored.origin, 'previous_cache')
-            self.assertEqual(restored.prices['gpt-6-sol'].input, 2)
-            self.assertEqual(prices.load_price_catalog(bundled_only=True).origin, 'bundled')
-            prices.clear_price_cache()
-            self.assertFalse(self.cache.exists())
-            self.assertFalse(prices.previous_cache_path().exists())
-            self.assertEqual(prices.load_price_catalog(offline=True).origin, 'bundled')
-            with patch.dict(os.environ, {'OAI_USAGE_OFFLINE_PRICES': '1'}):
-                self.assertEqual(prices.load_price_catalog().origin, 'bundled')
-
-    def test_cache_size_bound_rejects_bare_catalog_and_readonly_cache(self):
-        self.cache.parent.mkdir(parents=True)
-        self.cache.write_bytes(encoded(self.raw))
-        self.assertEqual(prices.load_price_catalog(offline=True).origin, 'bundled')
-        with self.assertRaises(ValueError):
-            prices.read_price_catalog(self.cache, 'cache')
-        self.cache.write_bytes(b'x' * (prices.MAX_CACHE_BYTES + 1))
-        self.assertEqual(prices.load_price_catalog(offline=True).origin, 'bundled')
-        with patch.object(prices, 'cache_price_catalog', side_effect=PermissionError('read only')):
-            result = self.load(self.raw)
-            self.assertEqual(result.origin, 'github')
-            self.assertTrue(result.warnings)
-
-    def test_staleness_and_cli_recovery_metadata(self):
-        old = copy.deepcopy(self.raw)
+    def test_staleness_and_each_load_fetches_current_prices(self):
+        old = sample()
         old['verified_at'] = (datetime.now(prices.UTC).date() - timedelta(days=46)).isoformat()
-        self.bundle.write_bytes(encoded(old))
-        self.assertTrue(prices.catalog_info(prices.load_price_catalog(bundled_only=True))['stale'])
-        self.load(self.raw)
-        cli = runpy.run_path(str(Path(prices.__file__).with_name('oai-usage')), run_name='recovery_test')
-        from contextlib import redirect_stdout
-        output = io.StringIO()
-        with redirect_stdout(output), patch.object(prices, 'fetch_https', side_effect=AssertionError('Must stay offline')):
-            self.assertEqual(cli['main'](['prices', '--bundled-prices', '--reset-price-cache', '--json']), 0)
-        data = json.loads(output.getvalue())
-        self.assertEqual(data['catalog_source'], 'bundled')
-        self.assertTrue(data['stale'])
-        self.assertFalse(self.cache.exists())
+        new = sample()
+        new['models']['gpt-6-sol']['input'] = '3'
+        with patch.object(prices, 'fetch_https', side_effect=[encoded(old), encoded(new)]) as fetch:
+            first = prices.load_price_catalog()
+            second = prices.load_price_catalog()
+            self.assertTrue(prices.catalog_info(first)['stale'])
+            self.assertFalse(prices.catalog_info(second)['stale'])
+            self.assertEqual(second.prices['gpt-6-sol'].input, 3)
+            self.assertEqual(fetch.call_count, 2)
 
 
 class DownloadSecurity(unittest.TestCase):

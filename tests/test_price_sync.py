@@ -32,7 +32,7 @@ class PriceSync(unittest.TestCase):
 
     def snapshot(self):
         return sync.collect((FIXTURES / 'openai-models-20260926.md').read_text(),
-                            (FIXTURES / 'models-dev-openai-20260926.json').read_bytes(), sync.load_rules())
+                            (FIXTURES / 'models-dev-openai-20260926.json').read_bytes())
 
     def current(self):
         return sync.updated_catalog(self.baseline(), self.snapshot(), '2026-09-26')
@@ -41,7 +41,7 @@ class PriceSync(unittest.TestCase):
         old = sync.catalog.parse_price_catalog(self.baseline(), 'old')
         raw = self.current()
         new = sync.catalog.parse_price_catalog(raw, 'new')
-        self.assertEqual(set(old.prices), set(new.prices))
+        self.assertTrue(old.prices.keys() <= new.prices.keys())
         for model, price in old.prices.items():
             for field in ('input', 'cached', 'write', 'output', 'long_input', 'long_cached',
                           'long_write', 'long_output', 'long_threshold', 'long_scope'):
@@ -59,7 +59,7 @@ class PriceSync(unittest.TestCase):
         other['cost']['input'] = 999
         values = sync.collect(listing('gpt-7-sol', 'claude-test'),
                               encoded({'gpt-7-sol': good, 'gpt-7-hidden': hidden},
-                                      anthropic={'models': {'gpt-7-sol': other, 'claude-test': other}}), {})
+                                      anthropic={'models': {'gpt-7-sol': other, 'claude-test': other}}))
         self.assertEqual(set(values), {'gpt-7-sol'})
         self.assertEqual(values['gpt-7-sol']['input'], '2')
         with self.assertRaisesRegex(ValueError, 'OpenAI model catalog'):
@@ -70,7 +70,7 @@ class PriceSync(unittest.TestCase):
         self.assertEqual(sync.official_models(document), {'gpt-7-sol'})
         aliased = row('gpt-7-sol-2027-01-01')
         with self.assertRaisesRegex(ValueError, 'No supported OpenAI'):
-            sync.collect(document, encoded({aliased['id']: aliased}), {})
+            sync.collect(document, encoded({aliased['id']: aliased}))
         with self.assertRaises(ValueError):
             sync.official_models('A mention of gpt-7-sol without a model link.')
         with self.assertRaises(ValueError):
@@ -79,16 +79,48 @@ class PriceSync(unittest.TestCase):
     def test_new_simple_text_model_is_discovered_without_code_change(self):
         value = row()
         del value['cost']['cache_write']
-        result = sync.collect(listing('gpt-7-sol'), encoded({'gpt-7-sol': value}), {})
+        result = sync.collect(listing('gpt-7-sol'), encoded({'gpt-7-sol': value}))
         self.assertEqual(result['gpt-7-sol']['cached_input'], '0.2')
         self.assertIsNone(result['gpt-7-sol']['cache_write'])
         self.assertIsNone(result['gpt-7-sol']['long_context'])
 
+    def test_models_without_cache_rates_import_and_new_cache_rates_update_automatically(self):
+        value = row()
+        value['cost'].pop('cache_read')
+        value['cost'].pop('cache_write')
+        discovered = sync.collect(listing('gpt-7-sol'), encoded({'gpt-7-sol': value}))
+        self.assertIsNone(discovered['gpt-7-sol']['cached_input'])
+        self.assertIsNone(discovered['gpt-7-sol']['cache_write'])
+        old = sync.updated_catalog(self.baseline(), discovered, '2026-09-30')
+        sync.validate_transition(self.baseline(), old)
+        new = copy.deepcopy(old)
+        new['models']['gpt-7-sol']['cached_input'] = '0.2'
+        sync.validate_transition(old, new)
+        removed = copy.deepcopy(new)
+        removed['models']['gpt-7-sol']['cached_input'] = None
+        with self.assertRaisesRegex(ValueError, 'lost'):
+            sync.validate_transition(new, removed)
+
+    def test_gpt_61_and_future_context_tiers_need_no_local_model_rules(self):
+        for model, threshold in (('gpt-6.1-sol', 272000), ('gpt-7-sol', 512000)):
+            value = row(model)
+            value['cost']['cache_read'] = 0.1
+            value['cost']['tiers'] = [{'input': 4, 'cache_read': 0.2, 'cache_write': 5,
+                                      'output': 15, 'tier': {'type': 'context', 'size': threshold}}]
+            discovered = sync.collect(listing(model), encoded({model: value}))
+            imported = discovered[model]
+            self.assertEqual(imported['cached_input'], '0.1')
+            self.assertEqual(imported['long_context']['scope'], 'request')
+            self.assertEqual(imported['long_context']['source'], sync.PRICES_URL)
+            self.assertEqual(imported['long_context']['threshold'], threshold)
+            candidate = sync.updated_catalog(self.baseline(), discovered, '2026-09-30')
+            sync.validate_transition(self.baseline(), candidate)
+
     def test_unsupported_or_missing_prices_are_pending_not_zero(self):
         valid = row('gpt-7-good')
         for mutate in (
-            lambda r: r['cost'].pop('cache_read'),
-            lambda r: r['cost'].update(cache_read=None),
+            lambda r: r['cost'].pop('input'),
+            lambda r: r['cost'].update(output=None),
             lambda r: r['modalities'].update(output=['audio']),
             lambda r: r['cost'].update(input_audio=2),
             lambda r: r.update(cost=None),
@@ -97,7 +129,7 @@ class PriceSync(unittest.TestCase):
             mutate(value)
             notes = []
             result = sync.collect(listing('gpt-7-good', 'gpt-7-sol', 'gpt-7-missing'),
-                                  encoded({'gpt-7-good': valid, 'gpt-7-sol': value}), {}, notes)
+                                  encoded({'gpt-7-good': valid, 'gpt-7-sol': value}), notes)
             self.assertEqual(set(result), {'gpt-7-good'})
             self.assertTrue(any('gpt-7-sol' in n for n in notes))
             self.assertTrue(any('gpt-7-missing' in n for n in notes))
@@ -117,52 +149,49 @@ class PriceSync(unittest.TestCase):
         bad = row()
         bad['id'] = 'gpt-7-other'
         with self.assertRaisesRegex(ValueError, 'does not match'):
-            sync.collect(listing('gpt-7-sol'), encoded({'gpt-7-sol': bad}), {})
+            sync.collect(listing('gpt-7-sol'), encoded({'gpt-7-sol': bad}))
 
     def tiered(self):
         value = row()
         value['cost']['tiers'] = [{'input': 4, 'cache_read': 0.4, 'cache_write': 5,
                                   'output': 15, 'tier': {'type': 'context', 'size': 272000}}]
-        rules = {'gpt-7-sol': {'threshold': 272000, 'scope': 'session',
-                             'source': sync.MODEL_URL.format('gpt-7-sol')}}
-        return value, rules
+        return value
 
-    def test_explicit_tier_and_reviewed_scope_control_long_context(self):
-        value, rules = self.tiered()
-        value['cost']['context_over_200k'] = {k: v for k, v in value['cost']['tiers'][0].items() if k != 'tier'}
-        result = sync.collect(listing('gpt-7-sol'), encoded({'gpt-7-sol': value}), rules)
+    def test_explicit_tier_supplies_threshold_and_request_prices(self):
+        value = self.tiered()
+        value['cost']['context_over_200k'] = {'input': 999}
+        result = sync.collect(listing('gpt-7-sol'), encoded({'gpt-7-sol': value}))
         long = result['gpt-7-sol']['long_context']
-        self.assertEqual((long['threshold'], long['scope'], long['output']), (272000, 'session', '15'))
+        self.assertEqual((long['threshold'], long['scope'], long['output']), (272000, 'request', '15'))
         value['cost']['tiers'][0]['tier']['size'] = 200000
-        with self.assertRaisesRegex(ValueError, 'changed long-context threshold'):
-            sync.collect(listing('gpt-7-sol'), encoded({'gpt-7-sol': value}), rules)
+        result = sync.collect(listing('gpt-7-sol'), encoded({'gpt-7-sol': value}))
+        self.assertEqual(result['gpt-7-sol']['long_context']['threshold'], 200000)
 
-    def test_unknown_long_rules_and_legacy_only_tiers_are_not_guessed(self):
-        value, rules = self.tiered()
-        for supplied in ({}, rules):
-            candidate = copy.deepcopy(value)
-            if supplied:
-                candidate['cost']['context_over_200k'] = candidate['cost'].pop('tiers')[0]
-            notes = []
-            result = sync.collect(listing('gpt-7-sol', 'gpt-7-good'),
-                                  encoded({'gpt-7-sol': candidate, 'gpt-7-good': row('gpt-7-good')}),
-                                  supplied, notes)
-            self.assertEqual(set(result), {'gpt-7-good'})
-            self.assertTrue(any('gpt-7-sol' in n for n in notes))
-        value['cost']['context_over_200k'] = {'input': 999, 'cache_read': .4, 'cache_write': 5, 'output': 15}
-        result = sync.collect(listing('gpt-7-sol'), encoded({'gpt-7-sol': value}), rules)
-        self.assertEqual(result['gpt-7-sol']['long_context']['input'], '4')
+    def test_legacy_only_tiers_are_not_assigned_a_guessed_threshold(self):
+        value = self.tiered()
+        value['cost']['context_over_200k'] = value['cost'].pop('tiers')[0]
+        notes = []
+        result = sync.collect(listing('gpt-7-sol', 'gpt-7-good'),
+                              encoded({'gpt-7-sol': value, 'gpt-7-good': row('gpt-7-good')}), notes)
+        self.assertEqual(set(result), {'gpt-7-good'})
+        self.assertTrue(any('explicit context tier' in note for note in notes))
 
-    def test_unsupported_tiers_and_missing_existing_tier_are_pending(self):
-        value, rules = self.tiered()
-        for tiers in ([], [value['cost']['tiers'][0]] * 2,
+    def test_unsupported_tiers_are_pending_and_existing_tier_cannot_disappear(self):
+        value = self.tiered()
+        for tiers in ([value['cost']['tiers'][0]] * 2,
                       [{'tier': {'type': 'batch', 'size': 272000}}]):
-            value['cost']['tiers'] = tiers
+            candidate = row()
+            candidate['cost']['tiers'] = tiers
             notes = []
             result = sync.collect(listing('gpt-7-sol', 'gpt-7-good'),
-                                  encoded({'gpt-7-sol': value, 'gpt-7-good': row('gpt-7-good')}), rules, notes)
+                                  encoded({'gpt-7-sol': candidate, 'gpt-7-good': row('gpt-7-good')}), notes)
             self.assertNotIn('gpt-7-sol', result)
             self.assertTrue(notes)
+        old = self.current()
+        new = copy.deepcopy(old)
+        new['models']['gpt-6-sol']['long_context'] = None
+        with self.assertRaisesRegex(ValueError, 'threshold'):
+            sync.validate_transition(old, new)
 
     def test_history_retained_without_advancing_check_date(self):
         old = self.current()
@@ -214,7 +243,7 @@ class PriceSync(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, 'Review required'):
                 sync.validate_transition(old, new)
         new = copy.deepcopy(old)
-        new['models']['gpt-6-sol']['long_context']['scope'] = 'session'
+        new['models']['gpt-6-sol']['long_context']['threshold'] = 200000
         with self.assertRaisesRegex(ValueError, 'Review required'):
             sync.validate_transition(old, new)
         with self.assertRaisesRegex(ValueError, '25%'):
@@ -224,18 +253,17 @@ class PriceSync(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'retained'):
             sync.validate_transition(old, new)
 
-    def test_new_zero_rate_model_and_unreviewed_long_rule_are_blocked(self):
+    def test_new_zero_rates_are_blocked_and_valid_context_tiers_are_publishable(self):
         old = self.current()
         for field in ('input', 'cached_input', 'cache_write', 'output'):
             new = copy.deepcopy(old)
-            new['models']['gpt-7-sol'] = sync.collect(listing('gpt-7-sol'), encoded({'gpt-7-sol': row()}), {})['gpt-7-sol']
+            new['models']['gpt-7-sol'] = sync.collect(listing('gpt-7-sol'), encoded({'gpt-7-sol': row()}))['gpt-7-sol']
             new['models']['gpt-7-sol'][field] = '0'
             with self.assertRaisesRegex(ValueError, 'zero price'):
                 sync.validate_transition(old, new)
-        value, rules = self.tiered()
-        new['models']['gpt-7-sol'] = sync.collect(listing('gpt-7-sol'), encoded({'gpt-7-sol': value}), rules)['gpt-7-sol']
-        with self.assertRaisesRegex(ValueError, 'local rule'):
-            sync.validate_transition(old, new)
+        new = copy.deepcopy(old)
+        new['models']['gpt-7-sol'] = sync.collect(listing('gpt-7-sol'), encoded({'gpt-7-sol': self.tiered()}))['gpt-7-sol']
+        sync.validate_transition(old, new)
 
     def test_failure_dry_run_and_offline_publisher_validation(self):
         old = self.baseline()
@@ -266,7 +294,7 @@ class PriceSync(unittest.TestCase):
         old = self.current()
         observed = copy.deepcopy(old['models'])
         del observed['gpt-6-astra']
-        def collect(_markdown, _data, _rules, warnings):
+        def collect(_markdown, _data, warnings):
             warnings.append('Pending gpt-7-sol: missing price.')
             return observed
         with tempfile.TemporaryDirectory() as directory:

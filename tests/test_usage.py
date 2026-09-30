@@ -13,7 +13,6 @@ import unittest
 from unittest.mock import patch
 
 SCRIPT = Path(__file__).resolve().parents[1] / 'oai-usage'
-os.environ.setdefault('OAI_USAGE_OFFLINE_PRICES', '1')
 M = runpy.run_path(str(SCRIPT), run_name='usage_tests')
 G = M['main'].__globals__
 U = M['Usage']
@@ -22,7 +21,16 @@ DT = M['datetime']
 
 
 def fixture_prices():
-    return M['read_price_catalog'](Path(__file__).parent / 'fixtures/prices.json', 'fixture').prices
+    return fixture_catalog().prices
+
+
+def fixture_catalog():
+    raw = json.loads((Path(__file__).parent / 'fixtures/prices.json').read_text())
+    return M['parse_price_catalog'](raw, 'fixture', today=DT.now(UTC).date())
+
+
+# Keep accounting/presentation tests deterministic; transport is tested separately.
+G['load_price_catalog'] = fixture_catalog
 
 
 def at(value='2026-09-22T01:00:00Z'):
@@ -106,6 +114,9 @@ class Fixtures(unittest.TestCase):
         self.assertEqual(sum(e.usage.total_tokens for e in sessions[0].events), 200)
         self.assertFalse(any(e.reset for e in sessions[0].events))
         self.assertEqual(issues['request_detail_exceeds_delta'], 1)
+        costs = M['priced_events'](sessions, fixture_prices())
+        self.assertFalse(costs[1][1].complete)
+        self.assertEqual(costs[1][1].amount, 0)
 
     def test_duplicate_snapshots_merge_richer_request_metadata(self):
         self.write('a.jsonl', [meta(), context(), token(300000, out=1000)])
@@ -117,12 +128,15 @@ class Fixtures(unittest.TestCase):
         self.assertTrue(rows[0][1].complete)
 
     def test_duplicate_metadata_conflicts_remain_uncertain(self):
-        for name, last in [('a',100000), ('b',300000), ('c',300000)]:
-            self.write(name+'.jsonl', [meta(), context(), token(300000, last=last)])
-        sessions, issues = self.scan()
-        cost = M['priced_events'](sessions, fixture_prices())[0][1]
-        self.assertFalse(cost.complete)
-        self.assertGreater(issues['conflicting_request_metadata'], 0)
+        for cumulative in (100000, 300000):
+            with self.subTest(cumulative=cumulative):
+                for name, last in [('a',50000), ('b',300000), ('c',300000)]:
+                    self.write(name+'.jsonl', [meta(), context(), token(cumulative, last=last)])
+                sessions, issues = self.scan()
+                cost = M['priced_events'](sessions, fixture_prices())[0][1]
+                self.assertFalse(cost.complete)
+                self.assertEqual(cost.amount, 0)
+                self.assertGreater(issues['conflicting_request_metadata'], 0)
 
     def test_zero_counter_reset(self):
         self.write('a.jsonl', [meta(), context(), token(100), token(0, 2), token(150, 3)])
@@ -317,14 +331,54 @@ class Accounting(unittest.TestCase):
     def test_threshold_and_unknown_request(self):
         prices = fixture_prices()
         self.assertEqual(M['charge'](self.event(n=272000, request=272000), prices).amount, M['Decimal']('2.72'))
-        self.assertFalse(M['charge'](self.event(n=300000), prices).complete)
+        unknown = M['charge'](self.event(n=300000), prices)
+        self.assertFalse(unknown.complete)
+        self.assertEqual(unknown.amount, 0)
+        self.assertIn('unknown_request_size', unknown.reasons)
         self.assertTrue(M['charge'](self.event(n=100000), prices).complete)
 
-    def test_session_long_context_applies_before_date_filter(self):
-        events = [self.event('gpt-5.5', n=100000, request=100000), self.event('gpt-5.5', n=300000, request=300000)]
+    def test_legacy_session_catalog_prices_short_long_short_requests_independently(self):
+        events = [
+            self.event('gpt-5.5', n=100000, request=100000),
+            M['replace'](self.event('gpt-5.5', n=300000, request=300000), at=at('2026-09-23T01:00:00Z')),
+            M['replace'](self.event('gpt-5.5', n=50000, request=50000), at=at('2026-09-24T01:00:00Z')),
+        ]
         session = M['Session']('session', None, None, [], events)
         rows = M['priced_events']([session], fixture_prices())
-        self.assertEqual(rows[0][1].amount, M['Decimal']('1'))
+        self.assertEqual([cost.amount for _, cost in rows], list(map(M['Decimal'], ['.5', '3', '.25'])))
+        selected = sum(cost.amount for event, cost in rows if M['included'](
+            event.at, at('2026-09-22T00:00:00Z'), at('2026-09-23T00:00:00Z')))
+        self.assertEqual(selected, M['Decimal']('.5'))
+
+    def test_unknown_request_size_does_not_contaminate_other_session_events(self):
+        events = [self.event(n=100000, request=100000), self.event(n=300000),
+                  self.event(n=50000, request=50000)]
+        rows = M['priced_events']([M['Session']('s', None, None, [], events)], fixture_prices())
+        self.assertEqual([cost.complete for _, cost in rows], [True, False, True])
+        bucket = M['Bucket']()
+        for event, cost in rows:
+            bucket.add(event, cost)
+        result = bucket.export()
+        self.assertIsNone(result['api_cost_usd'])
+        self.assertEqual(result['known_api_cost_usd'], 1.5)
+        self.assertEqual(result['uncertain_pricing_usage']['input_tokens'], 300000)
+
+    def test_conflicting_request_details_prevent_using_a_small_delta_as_a_prompt_bound(self):
+        event = M['replace'](self.event(n=50000), request_detail_uncertain=True)
+        cost = M['charge'](event, fixture_prices())
+        self.assertFalse(cost.complete)
+        self.assertEqual(cost.amount, 0)
+        self.assertEqual(cost.reasons, ('unknown_request_size',))
+
+    def test_missing_cache_read_price_retains_known_input_output_cost(self):
+        price = M['Price'](M['Decimal']('2'), None, M['Decimal']('10'))
+        event = M['Event']('s', at(), 'custom', U(100000, 20000, 0, 1000, 0, 101000), 100000)
+        cost = M['charge'](event, {'custom': price})
+        self.assertFalse(cost.complete)
+        self.assertIn('unknown_cache_read_price', cost.reasons)
+        self.assertEqual(cost.amount, M['Decimal']('.17'))
+        ordinary = self.event('custom', n=100000, out=1000, request=100000)
+        self.assertTrue(M['charge'](ordinary, {'custom': price}).complete)
 
     def test_cache_write_and_reasoning_not_double_counted(self):
         e = M['Event']('s', at(), 'gpt-6-astra', U(100, 50, 20, 10, 5, 110), 100)
@@ -571,9 +625,9 @@ class Presentation(unittest.TestCase):
             scanner, cache = M['Scanner'](), M['ReportCache']()
             with patch.dict(G, {'datetime': Clock}):
                 args = M['parse_args'](['watch', '--days', 'all', '--quota', 'live'])
-                old = M['report'](args, scanner, fixture_prices(), M['Calendar'].make('UTC'), [Path(root)], Poller(), cache)
+                old = M['report'](args, scanner, fixture_prices(), M['Calendar'].make('UTC'), [Path(root)], Poller(), cache, fixture_catalog())
                 bytes_before = scanner.bytes_read
-                new = M['report'](args, scanner, fixture_prices(), M['Calendar'].make('UTC'), [Path(root)], Poller(), cache)
+                new = M['report'](args, scanner, fixture_prices(), M['Calendar'].make('UTC'), [Path(root)], Poller(), cache, fixture_catalog())
             self.assertEqual(scanner.bytes_read, bytes_before)
             before, after = [d['summary']['cycle_estimates']['primary'] for d in (old, new)]
             self.assertEqual(before['local']['usage']['total_tokens'], 300)
@@ -595,7 +649,7 @@ class Presentation(unittest.TestCase):
             current = self.data()['summary']['current_rate_limits']
             with patch.dict(G, {'datetime': Clock, 'fetch_live': lambda *a: (current, None)}):
                 args = M['parse_args'](['--since', '2026-09-01', '--until', '2026-09-02', '--timezone', 'UTC'])
-                data = M['report'](args, M['Scanner'](), fixture_prices(), M['Calendar'].make('UTC'), [Path(root)])
+                data = M['report'](args, M['Scanner'](), fixture_prices(), M['Calendar'].make('UTC'), [Path(root)], price_catalog=fixture_catalog())
             self.assertEqual(data['summary']['usage']['total_tokens'], 0)
             self.assertEqual(data['summary']['cycle_estimates']['primary']['local']['usage']['total_tokens'], 100)
             text = M['render'](data, args, M['Calendar'].make('UTC'))

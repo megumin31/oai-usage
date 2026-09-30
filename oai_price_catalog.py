@@ -1,4 +1,4 @@
-"""Bounded price downloads, strict data validation, and recoverable local caches."""
+"""Bounded live price downloads and strict catalog validation."""
 from __future__ import annotations
 
 import json
@@ -18,11 +18,9 @@ from typing import Any, Optional
 
 UTC = timezone.utc
 PRICE_URL = "https://raw.githubusercontent.com/megumin31/oai-usage/main/prices.json"
-PRICE_FILE = Path(__file__).resolve().with_name("prices.json")
 MODELS_DEV_URL = "https://models.dev/api.json"
 MODEL_LIST_URL = "https://developers.openai.com/api/docs/models/all"
 MAX_BYTES = 1_000_000
-MAX_CACHE_BYTES = MAX_BYTES + 1024
 STALE_DAYS = 45
 RATE = re.compile(r"[0-9]{1,10}(?:\.[0-9]{1,12})?\Z")
 
@@ -30,7 +28,7 @@ RATE = re.compile(r"[0-9]{1,10}(?:\.[0-9]{1,12})?\Z")
 @dataclass(frozen=True)
 class Price:
     input: Decimal
-    cached: Decimal
+    cached: Optional[Decimal]
     output: Decimal
     write: Optional[Decimal] = None
     long_threshold: Optional[int] = None
@@ -221,22 +219,24 @@ def parse_price_catalog(raw: Any, origin: str, today: Optional[date] = None) -> 
         if row["source"] != MODELS_DEV_URL:
             raise ValueError("Invalid model price source")
         long = row["long_context"]
-        threshold, scope = None, "request"
+        threshold = None
         if long is not None:
             exact_keys(long, {"threshold", "scope", "input", "cached_input", "cache_write", "output", "source"})
-            threshold, scope = long["threshold"], long["scope"]
-            if type(threshold) is not int or not 0 < threshold <= 10_000_000 or scope not in ("request", "session"):
+            threshold = long["threshold"]
+            # Accept the old schema-2 session field for published catalogs;
+            # estimates always select the context tier per request.
+            if type(threshold) is not int or not 0 < threshold <= 10_000_000 or long["scope"] not in ("request", "session"):
                 raise ValueError("Invalid long-context rule")
-            if long["source"] != expected_source:
+            if long["source"] not in (MODELS_DEV_URL, expected_source):
                 raise ValueError("Invalid long-context rule source")
         write = amount(row["cache_write"], True)
         long_write = amount(long["cache_write"], True) if long else None
         if long and (write is None) != (long_write is None):
             raise ValueError("Inconsistent cache-write rates")
-        prices[model] = Price(amount(row["input"]), amount(row["cached_input"]), amount(row["output"]),
-                              write, threshold, scope, row["source"],
+        prices[model] = Price(amount(row["input"]), amount(row["cached_input"], True), amount(row["output"]),
+                              write, threshold, "request", row["source"],
                               amount(long["input"]) if long else None,
-                              amount(long["cached_input"]) if long else None,
+                              amount(long["cached_input"], True) if long else None,
                               long_write, amount(long["output"]) if long else None,
                               row["model_source"], long["source"] if long else None)
     return PriceCatalog(prices, verified_at, origin, source=raw["source"], model_source=raw["model_source"])
@@ -248,35 +248,6 @@ def read_limited(path: Path, limit: int = MAX_BYTES) -> bytes:
     if len(data) > limit:
         raise ValueError("Price file is too large")
     return data
-
-
-def price_cache_path() -> Path:
-    return Path(os.environ.get("XDG_CACHE_HOME", "~/.cache")).expanduser() / "oai-usage" / "prices.json"
-
-
-def previous_cache_path() -> Path:
-    return price_cache_path().with_name("prices.previous.json")
-
-
-def read_price_catalog(path: Path, origin: str) -> PriceCatalog:
-    raw = strict_json(read_limited(path, MAX_CACHE_BYTES), MAX_CACHE_BYTES)
-    fetched_at = None
-    if origin in ("cache", "previous_cache"):
-        exact_keys(raw, {"cache_schema_version", "fetched_at", "catalog"})
-        if type(raw["cache_schema_version"]) is not int or raw["cache_schema_version"] != 1:
-            raise ValueError("Invalid price cache version")
-        fetched_at = raw["fetched_at"]
-        if not isinstance(fetched_at, str) or len(fetched_at) > 40:
-            raise ValueError("Invalid cache download time")
-        fetched = datetime.fromisoformat(fetched_at)
-        if fetched.tzinfo is None or fetched > datetime.now(UTC) + timedelta(days=1):
-            raise ValueError("Invalid cache download time")
-        raw = raw["catalog"]
-    return replace(parse_price_catalog(raw, origin), fetched_at=fetched_at)
-
-
-def default_prices() -> dict:
-    return read_price_catalog(PRICE_FILE, "bundled").prices
 
 
 def atomic_write(path: Path, data: bytes) -> None:
@@ -293,25 +264,6 @@ def atomic_write(path: Path, data: bytes) -> None:
             os.unlink(temporary)
 
 
-def cache_price_catalog(data: bytes, fetched_at: str) -> None:
-    raw = strict_json(data)
-    incoming = parse_price_catalog(raw, "github")
-    path = price_cache_path()
-    try:
-        prior = read_price_catalog(path, "cache")
-        if (prior.prices, prior.verified_at) != (incoming.prices, incoming.verified_at):
-            atomic_write(previous_cache_path(), read_limited(path, MAX_CACHE_BYTES))
-    except (OSError, ValueError):
-        pass
-    envelope = {"cache_schema_version": 1, "fetched_at": fetched_at, "catalog": raw}
-    atomic_write(path, (json.dumps(envelope, ensure_ascii=False) + "\n").encode())
-
-
-def clear_price_cache() -> None:
-    for path in (price_cache_path(), previous_cache_path()):
-        path.unlink(missing_ok=True)
-
-
 def catalog_info(catalog: PriceCatalog) -> dict:
     stale = (datetime.now(UTC).date() - date.fromisoformat(catalog.verified_at)).days > STALE_DAYS
     warnings = list(catalog.warnings)
@@ -322,33 +274,24 @@ def catalog_info(catalog: PriceCatalog) -> dict:
             "price_source": catalog.source, "model_source": catalog.model_source}
 
 
-def load_price_catalog(offline: bool = False, bundled_only: bool = False) -> PriceCatalog:
-    if bundled_only:
-        return read_price_catalog(PRICE_FILE, "bundled")
-    offline = offline or os.environ.get("OAI_USAGE_OFFLINE_PRICES") == "1"
-    if not offline:
-        try:
-            data = fetch_https(PRICE_URL)
-            catalog = parse_price_catalog(strict_json(data), "github")
-            fetched_at = datetime.now(UTC).isoformat()
-            catalog = replace(catalog, fetched_at=fetched_at)
-            try:
-                cache_price_catalog(data, fetched_at)
-            except OSError:
-                catalog = replace(catalog, warnings=("Fresh prices loaded; the local cache could not be saved.",))
-            return catalog
-        except (OSError, ValueError, HTTPException, RecursionError):
-            pass
-    for path, origin in ((price_cache_path(), "cache"), (previous_cache_path(), "previous_cache"), (PRICE_FILE, "bundled")):
-        try:
-            catalog = read_price_catalog(path, origin)
-            return catalog if offline else replace(catalog, warnings=(f"Remote prices unavailable or invalid; using {origin} prices.",))
-        except (OSError, ValueError, RecursionError):
-            continue
-    raise ValueError("No valid price catalog; restore the bundled prices.json or retry online")
+def read_price_catalog(path: Path, origin: str) -> PriceCatalog:
+    return parse_price_catalog(strict_json(read_limited(path)), origin)
 
 
-if __name__ == "__main__":
+def load_price_catalog() -> PriceCatalog:
+    try:
+        data = fetch_https(PRICE_URL)
+        catalog = parse_price_catalog(strict_json(data), "github")
+    except (OSError, ValueError, HTTPException, RecursionError) as exc:
+        raise ValueError("Unable to load prices from GitHub; check your network and retry.") from exc
+    return replace(catalog, fetched_at=datetime.now(UTC).isoformat())
+
+
+def default_prices() -> dict:
+    return load_price_catalog().prices
+
+
+def download_main() -> None:
     if len(sys.argv) != 5 or sys.argv[1] != "--download":
         raise SystemExit("This module is loaded by oai-usage; it is not a standalone command")
     try:
@@ -358,3 +301,7 @@ if __name__ == "__main__":
         sys.stdout.buffer.write(_download(sys.argv[2], download_limit, read_timeout))
     except (OSError, ValueError, HTTPException):
         raise SystemExit("Price download failed")
+
+
+if __name__ == "__main__":
+    download_main()
