@@ -1498,6 +1498,35 @@ def style_line(line: str) -> str:
     return line.replace("│", "\033[36m│\033[0m")
 
 
+def terminal_ansi() -> tuple:
+    """Enable Windows VT output; return support and an optional mode restore."""
+    if not WINDOWS or not sys.stdout.isatty():
+        return True, None
+    try:
+        import ctypes
+        import msvcrt
+        from ctypes import wintypes
+
+        console = ctypes.WinDLL("kernel32", use_last_error=True)
+        console.GetConsoleMode.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+        console.GetConsoleMode.restype = wintypes.BOOL
+        console.SetConsoleMode.argtypes = [wintypes.HANDLE, wintypes.DWORD]
+        console.SetConsoleMode.restype = wintypes.BOOL
+        handle = wintypes.HANDLE(msvcrt.get_osfhandle(sys.stdout.fileno()))
+        mode = wintypes.DWORD()
+        if not console.GetConsoleMode(handle, ctypes.byref(mode)):
+            return False, None
+        # Preserve existing flags; VT also requires processed output.
+        requested = mode.value | 0x0001 | 0x0004
+        if requested == mode.value:
+            return True, None
+        if not console.SetConsoleMode(handle, requested):
+            return False, None
+        return True, lambda: console.SetConsoleMode(handle, mode.value)
+    except (ImportError, OSError, ValueError):
+        return False, None
+
+
 def render(data: dict, args: argparse.Namespace, calendar: Calendar, columns: int = 120) -> str:
     columns = max(8, min(columns, 140))
     compact = args.command == "watch"
@@ -1754,8 +1783,9 @@ async def run_command(args: argparse.Namespace, scheduler: QueryScheduler) -> in
     codex_home = Path(os.environ.get("CODEX_HOME", "~/.codex")).expanduser()
     roots = [Path(r).expanduser().resolve() for r in args.root] if args.root else [codex_home / "sessions", codex_home / "archived_sessions"]
     json_stdout = args.json or args.output == "-"
-    tty_watch = args.command == "watch" and sys.stdout.isatty() and not json_stdout
-    colors = not args.no_color and "NO_COLOR" not in os.environ and (args.color or sys.stdout.isatty())
+    ansi, restore_ansi = terminal_ansi() if not json_stdout else (False, None)
+    tty_watch = args.command == "watch" and sys.stdout.isatty() and not json_stdout and ansi
+    colors = ansi and not args.no_color and "NO_COLOR" not in os.environ and (args.color or sys.stdout.isatty())
     scanner = Scanner()
     cache = ReportCache()
     screen_started = False
@@ -1812,9 +1842,13 @@ async def run_command(args: argparse.Namespace, scheduler: QueryScheduler) -> in
         print(f"oai-usage: {exc}", file=sys.stderr)
         return 1
     finally:
-        if screen_started:
-            sys.stdout.write("\033[?1049l\033[?25h")
-            sys.stdout.flush()
+        try:
+            if screen_started:
+                sys.stdout.write("\033[?1049l\033[?25h")
+                sys.stdout.flush()
+        finally:
+            if restore_ansi:
+                restore_ansi()
 
 
 def main(argv: Optional[list] = None) -> int:

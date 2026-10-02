@@ -82,6 +82,8 @@ python3 ./oai-usage prices
 
 `watch` 默认每 2 秒刷新；额度查询完成后等待 30 秒再查，可用 `--refresh` 和 `--quota-interval` 调整。`--count N` 限制刷新次数。找不到 Codex 时，可用 `--codex-binary` 指定程序路径。
 
+Windows 控制台会自动启用终端控制，并在退出时恢复原模式；启用失败时关闭颜色，`watch` 改为逐帧普通输出，不清屏或隐藏光标。
+
 价格来自第三方 models.dev 的 OpenAI 数据，经仓库整理为 [`prices.json`](./prices.json)。客户端仅从 GitHub 下载成品表，不保存价格缓存。启动取价失败会退出；watch 每小时后台刷新价格，失败时继续使用本轮有效价格。
 
 成本按准确模型 ID、单次请求的输入量和价格档位估算，**不是历史账单或订阅账单**。未知模型、请求信息不足或缓存单价缺失时，结果会标为不完整。

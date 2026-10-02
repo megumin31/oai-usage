@@ -82,6 +82,8 @@ Use `report --help`, `watch --help`, or `prices --help` for all options. Common 
 
 `watch` refreshes every 2 seconds by default. Each quota query is followed by a 30-second wait; adjust these with `--refresh` and `--quota-interval`. `--count N` limits refreshes. Use `--codex-binary` if Codex cannot be found automatically.
 
+Windows consoles automatically enable terminal controls and restore the original mode on exit. If this fails, colors are disabled and `watch` prints plain frames without clearing the screen or hiding the cursor.
+
 Prices come from third-party models.dev OpenAI data, maintained as the repository's [`prices.json`](./prices.json). The consumer downloads only the finished GitHub catalog and saves no price cache. Startup price failure exits the program. Watch refreshes prices hourly in the background and keeps the current run's valid catalog if a refresh fails.
 
 Costs use exact model IDs and select price tiers per request. They are **neither historical bills nor subscription bills**. Unknown models, insufficient request details, or missing cache prices mark the estimate as incomplete.

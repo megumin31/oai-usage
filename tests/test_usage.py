@@ -1,4 +1,5 @@
 import contextlib
+import ctypes
 import io
 import json
 import os
@@ -9,7 +10,8 @@ import sys
 import tempfile
 import time
 import unittest
-from unittest.mock import patch
+from types import SimpleNamespace
+from unittest.mock import Mock, call, patch
 
 SCRIPT = Path(__file__).resolve().parents[1] / 'oai-usage'
 M = runpy.run_path(str(SCRIPT), run_name='usage_tests')
@@ -531,6 +533,7 @@ class Presentation(unittest.TestCase):
                 return True
         output = Terminal()
         with patch.dict(G, {'report': lambda *a, **kw: self.data()}), \
+             patch.dict(G, {'terminal_ansi': lambda: (True, None)}), \
              patch.object(M['shutil'], 'get_terminal_size', return_value=os.terminal_size((100, 24))), \
              contextlib.redirect_stdout(output), patch.dict(os.environ):
             os.environ.pop('NO_COLOR', None)
@@ -555,6 +558,7 @@ class Presentation(unittest.TestCase):
         for columns in (20, 30, 40):
             output = Terminal()
             with self.subTest(columns=columns), patch.dict(G, {'report': lambda *a, **kw: self.data()}), \
+                 patch.dict(G, {'terminal_ansi': lambda: (True, None)}), \
                  patch.object(M['shutil'], 'get_terminal_size', return_value=os.terminal_size((columns, 24))), \
                  contextlib.redirect_stdout(output):
                 self.assertEqual(M['main'](['watch', '--quota', 'logs', '--count', '1', '--no-color']), 0)
@@ -670,6 +674,103 @@ class Presentation(unittest.TestCase):
             text = M['render'](data, args, M['Calendar'].make('UTC'))
             self.assertIn('$0.001000', text)
             self.assertIn('No usage in this report period', text)
+
+
+class TerminalCompatibility(unittest.TestCase):
+    class Terminal(io.StringIO):
+        def isatty(self):
+            return True
+
+        def fileno(self):
+            return 1
+
+    def setUp(self):
+        self.output = self.Terminal()
+        self.enterContext(contextlib.redirect_stdout(self.output))
+        self.enterContext(patch.dict(os.environ))
+        os.environ.pop('NO_COLOR', None)
+
+    def windows_console(self, mode=0x0052, readable=True, writable=True):
+        console = Mock()
+
+        def get_mode(handle, pointer):
+            pointer._obj.value = mode
+            return readable
+
+        console.GetConsoleMode.side_effect = get_mode
+        console.SetConsoleMode.return_value = writable
+        self.enterContext(patch.dict(sys.modules, {'msvcrt': SimpleNamespace(
+            get_osfhandle=Mock(return_value=0x123456789))}))
+        self.enterContext(patch.object(ctypes, 'WinDLL', return_value=console, create=True))
+        self.enterContext(patch.dict(G, {'WINDOWS': True}))
+        return console
+
+    def run_dashboard(self, *args):
+        data = Presentation().data()
+        with patch.dict(G, {'report': lambda *a, **kw: data}), \
+             patch.object(M['shutil'], 'get_terminal_size', return_value=os.terminal_size((100, 24))):
+            return M['main']([*args, '--quota', 'logs'])
+
+    def test_windows_enables_vt_preserving_and_restoring_mode(self):
+        console = self.windows_console()
+        ansi, restore = M['terminal_ansi']()
+        self.assertTrue(ansi)
+        handle = console.GetConsoleMode.call_args.args[0]
+        self.assertEqual(handle.value, 0x123456789)
+        self.assertEqual(console.GetConsoleMode.argtypes[0], ctypes.wintypes.HANDLE)
+        console.SetConsoleMode.assert_called_once_with(handle, 0x0057)
+        restore()
+        self.assertEqual(console.SetConsoleMode.call_args_list, [call(handle, 0x0057), call(handle, 0x0052)])
+
+    def test_already_enabled_console_needs_no_changes(self):
+        console = self.windows_console(mode=0x0057)
+        self.assertEqual(M['terminal_ansi'](), (True, None))
+        console.SetConsoleMode.assert_not_called()
+
+    def test_windows_watch_restores_screen_and_mode(self):
+        console = self.windows_console()
+        self.assertEqual(self.run_dashboard('watch', '--count', '1', '--color'), 0)
+        text = self.output.getvalue()
+        self.assertIn('\033[1;36mOAI USAGE', text)
+        self.assertIn('Current cycle · Primary', text)
+        self.assertIn('Current cycle · Secondary', text)
+        self.assertTrue(text.endswith('\033[?1049l\033[?25h'))
+        self.assertEqual([args.args[1] for args in console.SetConsoleMode.call_args_list], [0x0057, 0x0052])
+
+    def test_unsupported_windows_console_prints_plain_watch_frames(self):
+        console = self.windows_console(writable=False)
+        self.assertEqual(self.run_dashboard('watch', '--count', '1', '--color'), 0)
+        self.assertNotIn('\033', self.output.getvalue())
+        self.assertIn('Current cycle · Primary', self.output.getvalue())
+        console.SetConsoleMode.assert_called_once()
+
+    def test_windows_mode_read_failure_degrades_without_setting_mode(self):
+        console = self.windows_console(readable=False)
+        self.assertEqual(M['terminal_ansi'](), (False, None))
+        console.SetConsoleMode.assert_not_called()
+
+    def test_windows_restores_mode_after_render_error(self):
+        console = self.windows_console()
+        with patch.dict(G, {'render': Mock(side_effect=ValueError('render failed'))}), \
+             contextlib.redirect_stderr(io.StringIO()):
+            self.assertEqual(self.run_dashboard(), 1)
+        self.assertEqual([args.args[1] for args in console.SetConsoleMode.call_args_list], [0x0057, 0x0052])
+
+    def test_json_does_not_touch_windows_console(self):
+        console = self.windows_console()
+        self.assertEqual(self.run_dashboard('--json', '--color'), 0)
+        self.assertNotIn('\033', self.output.getvalue())
+        self.assertTrue(json.loads(self.output.getvalue())['summary']['cycle_estimates'])
+        console.GetConsoleMode.assert_not_called()
+        console.SetConsoleMode.assert_not_called()
+
+    def test_redirected_output_does_not_touch_windows_console(self):
+        console = self.windows_console()
+        with contextlib.redirect_stdout(io.StringIO()) as output:
+            self.assertEqual(self.run_dashboard('--color'), 0)
+        self.assertIn('\033[1;36mOAI USAGE', output.getvalue())
+        console.GetConsoleMode.assert_not_called()
+        console.SetConsoleMode.assert_not_called()
 
 
 class Quotas(unittest.TestCase):
