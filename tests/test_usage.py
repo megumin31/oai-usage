@@ -292,6 +292,18 @@ raise SystemExit(namespace["main"](sys.argv[2:]))
 
 
 class Accounting(unittest.TestCase):
+    def test_display_uses_the_selected_timezone_offset(self):
+        cases = ((8, '中国标准时间', '2026-09-22 09:00 UTC+08:00'),
+                 (-6, 'CST', '2026-09-21 19:00 UTC-06:00'),
+                 (5.5, 'India Standard Time', '2026-09-22 06:30 UTC+05:30'),
+                 (0, 'Coordinated Universal Time', '2026-09-22 01:00 UTC'))
+        for hours, name, expected in cases:
+            with self.subTest(name=name):
+                zone = M['timezone'](M['timedelta'](hours=hours), name)
+                calendar = M['Calendar'](zone=zone)
+                self.assertEqual(calendar.display(at()), expected)
+                self.assertEqual(calendar.display(None), 'unbounded')
+
     def event(self, model='gpt-6-astra', n=100, out=0, request=None):
         return M['Event']('session', at(), model, usage(n, out), request)
 

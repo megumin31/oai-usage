@@ -6,7 +6,7 @@ Summarize token usage from local Codex logs, estimate API-equivalent costs, and 
 
 ## Quick start
 
-Use the latest stable Python 3. Examples use `python3`; replace it with `python` if that is your interpreter command. On Windows, use PowerShell 7.4+.
+Use the latest stable Python 3. Examples use `python3`; replace it with `python` if that is your interpreter command. Windows users should first read [Windows setup and notes](#windows-setup-and-notes) below.
 
 Download and run directly:
 
@@ -40,6 +40,50 @@ curl -fsSL https://raw.githubusercontent.com/megumin31/oai-usage/main/oai-usage 
 ```
 
 </details>
+
+## Windows setup and notes
+
+Use a current stable PowerShell (7.4+) and the latest stable Python 3. First, install PowerShell and the official Python install manager with WinGet from your existing PowerShell:
+
+```powershell
+winget install --id Microsoft.PowerShell --exact --source winget
+winget install --id Python.PythonInstallManager --exact --source winget
+```
+
+After installation, close and reopen your terminal. Open **PowerShell 7** from the Start menu, or enter `pwsh` in a new terminal. PowerShell 7 installs alongside the built-in Windows PowerShell 5.1; existing windows do not switch automatically. Then install Python; with the manager's default configuration, `default` selects the latest stable release without pinning a minor version:
+
+```powershell
+pymanager install default
+```
+
+Check your versions:
+
+```powershell
+$PSVersionTable.PSVersion
+python --version
+```
+
+If `winget` is unavailable, install or update **App Installer** from the Microsoft Store. Alternatively, follow the official [PowerShell installation guide](https://learn.microsoft.com/powershell/scripting/install/install-powershell-on-windows) and [Python installation guide](https://docs.python.org/3/using/windows.html).
+
+Run directly in PowerShell 7:
+
+```powershell
+curl.exe -fsSL https://raw.githubusercontent.com/megumin31/oai-usage/main/oai-usage | python -
+```
+
+Windows examples explicitly use `curl.exe` to avoid the different `curl` alias in older PowerShell versions. If `python` is missing or opens the Microsoft Store, but `py --version` works, replace `python` with `py`. No additional Python dependencies are required.
+
+After downloading the script to your current directory, you can also run:
+
+```powershell
+python .\oai-usage
+python .\oai-usage watch
+python .\oai-usage --days all
+```
+
+For the Codex desktop app's default Windows-native agent environment, run this script with Windows Python in PowerShell. Without `CODEX_HOME`, the script reads `sessions` and `archived_sessions` under `%USERPROFILE%\.codex`. Changing only the app's integrated terminal shell does not change this path. The agent environment is a separate setting; see the [Codex Windows documentation](https://learn.chatgpt.com/docs/windows/windows-app#windows-subsystem-for-linux-wsl).
+
+If you changed the agent environment or `CODEX_HOME`, confirm that the script reads the actual log location; it does not automatically search other directories in WSL. Repeat `--root` to specify log directories explicitly (replacing the defaults), including both `sessions` and `archived_sessions`. `--root` only changes log scanning, not the Codex executable or login environment used for live quota queries. Reports cover the last 30 days by default; use `--days all` for older records.
 
 ## Common commands
 
@@ -92,7 +136,7 @@ The current cycle uses the quota interface's actual window, independently of rep
 
 Logs are read from `sessions` and `archived_sessions` under `$CODEX_HOME` (or `~/.codex` when unset); `--root` replaces these directories. Original logs are read-only, with no log uploads or credential-content reads. `--json` emits complete data; watch emits one JSON line per frame. `--output` cannot overwrite the program or JSONL logs.
 
-Dates use the local time zone by default. UTC needs no extra data; other named time zones depend on the system time-zone database.
+Dates use the local time zone by default. UTC needs no extra data; other named time zones depend on the system time-zone database. Terminal dates show the actual offset at that point in time as `UTC±HH:MM`, or `UTC` for a zero offset.
 
 ## Development and testing
 

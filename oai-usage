@@ -446,7 +446,12 @@ class Calendar:
         return self.local(dt).date().isoformat() if dt else "unknown"
 
     def display(self, dt: Optional[datetime]) -> str:
-        return self.local(dt).strftime("%Y-%m-%d %H:%M %Z") if dt else "unbounded"
+        if dt is None:
+            return "unbounded"
+        local = self.local(dt)
+        # OS names may be localized or ambiguous; retain the actual local offset.
+        label = timezone(local.utcoffset()).tzname(None)
+        return f"{local:%Y-%m-%d %H:%M} {label}"
 
 
 @dataclass(frozen=True)
