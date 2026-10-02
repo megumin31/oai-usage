@@ -26,7 +26,7 @@ jobs:
         with:
           python-version: '3.x'
           check-latest: true
-      - name: Match official OpenAI models with models.dev prices
+      - name: Collect OpenAI provider prices from models.dev
         run: python3 scripts/update_prices.py --output candidate/prices.json
       - name: Verify calculator and price sync
         run: |

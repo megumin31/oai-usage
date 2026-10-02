@@ -32,7 +32,6 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 UTC = timezone.utc
 PRICE_URL = "https://raw.githubusercontent.com/megumin31/oai-usage/main/prices.json"
 MODELS_DEV_URL = "https://models.dev/api.json"
-MODEL_LIST_URL = "https://developers.openai.com/api/docs/models/all"
 MAX_BYTES = 1_000_000
 STALE_DAYS = 45
 RATE = re.compile(r"[0-9]{1,10}(?:\.[0-9]{1,12})?\Z")
@@ -50,8 +49,6 @@ class Price:
     long_cached: Optional[Decimal] = None
     long_write: Optional[Decimal] = None
     long_output: Optional[Decimal] = None
-    model_source: Optional[str] = None
-    rule_source: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -62,7 +59,6 @@ class PriceCatalog:
     fetched_at: Optional[str] = None
     warnings: tuple = ()
     source: Optional[str] = None
-    model_source: Optional[str] = None
 
 
 class DownloadError(ValueError):
@@ -276,10 +272,10 @@ def exact_keys(value: Any, expected: set) -> None:
 
 
 def parse_price_catalog(raw: Any, origin: str, today: Optional[date] = None) -> PriceCatalog:
-    exact_keys(raw, {"basis", "verified_at", "source", "models", "provider", "model_source"})
+    exact_keys(raw, {"basis", "verified_at", "source", "models", "provider"})
     if raw["basis"] != "standard_api_equivalent":
         raise ValueError("Invalid price catalog basis")
-    if raw["provider"] != "openai" or raw["model_source"] != MODEL_LIST_URL:
+    if raw["provider"] != "openai":
         raise ValueError("Invalid price catalog model provider")
     if raw["source"] != MODELS_DEV_URL:
         raise ValueError("Invalid price catalog upstream source")
@@ -311,32 +307,24 @@ def parse_price_catalog(raw: Any, origin: str, today: Optional[date] = None) -> 
     for model, row in models.items():
         if not isinstance(model, str) or not re.fullmatch(r"[a-z0-9][a-z0-9._-]{0,79}", model):
             raise ValueError("Invalid price catalog model")
-        exact_keys(row, {"input", "cached_input", "cache_write", "output", "long_context", "source", "model_source"})
-        expected_source = "https://developers.openai.com/api/docs/models/" + model
-        if row["model_source"] != expected_source:
-            raise ValueError("Invalid model identity source")
-        if row["source"] != MODELS_DEV_URL:
-            raise ValueError("Invalid model price source")
+        exact_keys(row, {"input", "cached_input", "cache_write", "output", "long_context"})
         long = row["long_context"]
         threshold = None
         if long is not None:
-            exact_keys(long, {"threshold", "input", "cached_input", "cache_write", "output", "source"})
+            exact_keys(long, {"threshold", "input", "cached_input", "cache_write", "output"})
             threshold = long["threshold"]
             if type(threshold) is not int or not 0 < threshold <= 10_000_000:
                 raise ValueError("Invalid long-context rule")
-            if long["source"] != MODELS_DEV_URL:
-                raise ValueError("Invalid long-context rule source")
         write = amount(row["cache_write"], True)
         long_write = amount(long["cache_write"], True) if long else None
         if long and (write is None) != (long_write is None):
             raise ValueError("Inconsistent cache-write rates")
         prices[model] = Price(amount(row["input"]), amount(row["cached_input"], True), amount(row["output"]),
-                              write, threshold, row["source"],
+                              write, threshold, MODELS_DEV_URL,
                               amount(long["input"]) if long else None,
                               amount(long["cached_input"], True) if long else None,
-                              long_write, amount(long["output"]) if long else None,
-                              row["model_source"], long["source"] if long else None)
-    return PriceCatalog(prices, verified_at, origin, source=raw["source"], model_source=raw["model_source"])
+                              long_write, amount(long["output"]) if long else None)
+    return PriceCatalog(prices, verified_at, origin, source=raw["source"])
 
 
 def catalog_info(catalog: PriceCatalog) -> dict:
@@ -346,7 +334,7 @@ def catalog_info(catalog: PriceCatalog) -> dict:
         warnings.append(f"Price sources were last checked more than {STALE_DAYS} days ago.")
     return {"verified_at": catalog.verified_at, "catalog_source": catalog.origin,
             "fetched_at": catalog.fetched_at, "stale": stale, "warnings": warnings,
-            "price_source": catalog.source, "model_source": catalog.model_source}
+            "source": catalog.source}
 
 
 async def load_price_catalog_async() -> PriceCatalog:
@@ -776,8 +764,7 @@ def price_overrides(values: list, base: dict) -> dict:
                               scaled(numbers[0], reference.input, reference.long_input) if reference else None,
                               scaled(numbers[1], reference.cached, reference.long_cached) if reference else None,
                               scaled(write, reference.write, reference.long_write) if reference else None,
-                              scaled(numbers[2], reference.output, reference.long_output) if reference else None,
-                              old.model_source if old else None, old.rule_source if old else None)
+                              scaled(numbers[2], reference.output, reference.long_output) if reference else None)
     return prices
 
 
@@ -1329,7 +1316,7 @@ def report(args: argparse.Namespace, scanner: Scanner, prices: dict, calendar: C
                     "long_cached_input": str(p.long_cached) if p.long_cached is not None else None,
                     "long_cache_write": str(p.long_write) if p.long_write is not None else None,
                     "long_output": str(p.long_output) if p.long_output is not None else None,
-                    "source": p.source, "model_source": p.model_source, "rule_source": p.rule_source}
+                    "source": p.source}
                     for k, p in sorted(prices.items())}},
             "diagnostics": {"files": len(rollouts), "issues": dict(sorted(issues.items())),
                             "bytes_read_this_process": scanner.bytes_read},
@@ -1742,7 +1729,6 @@ async def run_command(args: argparse.Namespace, scheduler: QueryScheduler) -> in
     if args.command == "prices":
         rows = [{"model": model, "input": str(p.input), "cached": str(p.cached) if p.cached is not None else None, "output": str(p.output),
                  "cache_write": str(p.write) if p.write is not None else None, "source": p.source,
-                 "model_source": p.model_source, "rule_source": p.rule_source,
                  "long_context_threshold": p.long_threshold,
                  "long_input": str(p.long_input) if p.long_input is not None else None,
                  "long_cached_input": str(p.long_cached) if p.long_cached is not None else None,
@@ -1752,7 +1738,7 @@ async def run_command(args: argparse.Namespace, scheduler: QueryScheduler) -> in
         if args.json:
             print(json.dumps({**catalog_info(price_catalog), "prices": rows}, ensure_ascii=False, indent=2))
         else:
-            print(f"Standard API prices · USD / 1M tokens · Sources checked {price_catalog.verified_at} · {price_catalog.origin}")
+            print(f"API-equivalent prices · USD / 1M tokens · Source checked {price_catalog.verified_at} · {price_catalog.origin}")
             print("\n".join(table(["Model", "Input", "Cached", "Output", "Write"],
                 [[r['model'], r['input'], r['cached'] if r['cached'] is not None else '-', r['output'], r['cache_write'] or '-'] for r in rows])))
             for warning in catalog_info(price_catalog)["warnings"]:
@@ -1763,10 +1749,6 @@ async def run_command(args: argparse.Namespace, scheduler: QueryScheduler) -> in
                         f"input {r['long_input']}, cached {r['long_cached_input'] or '-'}, "
                         f"write {r['long_cache_write'] or '-'}, output {r['long_output']}") if r['long_context_threshold'] else ""
                 print(f"{r['model']}{rule}: {r['source']}")
-                if r['model_source']:
-                    print(f"  Model: {r['model_source']}")
-                if r['rule_source']:
-                    print(f"  Context rule: {r['rule_source']}")
         return 0
     calendar = Calendar.make(args.timezone)
     codex_home = Path(os.environ.get("CODEX_HOME", "~/.codex")).expanduser()

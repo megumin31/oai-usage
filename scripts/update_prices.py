@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Sync OpenAI text prices using official model IDs and models.dev prices."""
+"""Sync OpenAI model IDs and text prices from models.dev."""
 from __future__ import annotations
 
 import argparse
@@ -18,11 +18,8 @@ else:
     import price_support as catalog
 
 CATALOG = ROOT / "prices.json"
-MODELS_URL = catalog.MODEL_LIST_URL + ".md"
 PRICES_URL = catalog.MODELS_DEV_URL
-MODEL_URL = "https://developers.openai.com/api/docs/models/{}"
 MODEL_ID = re.compile(r"gpt-(\d{1,3})(?:\.(\d{1,3}))?(?:-[a-z][a-z0-9-]*)?\Z")
-MODEL_LINK = re.compile(r"\[[^\]\n]+\]\((?:https://developers\.openai\.com)?/api/docs/models/([a-z0-9][a-z0-9.-]{0,79}?)\)")
 RATE_FIELDS = {"input": "input", "cached_input": "cache_read", "cache_write": "cache_write", "output": "output"}
 COST_FIELDS = {"input", "output", "cache_read", "cache_write", "tiers", "context_over_200k"}
 
@@ -38,15 +35,6 @@ def supported_id(model: str) -> bool:
 
 def fetch(url: str) -> bytes:
     return catalog.fetch_https(url, limit=catalog.download_budget(url), total_timeout=20, socket_timeout=5)
-
-
-def official_models(markdown: str) -> set[str]:
-    if len(markdown.encode("utf-8")) > 2_000_000 or any(len(line) > 8192 for line in markdown.splitlines()):
-        raise ValueError("Official model directory is too large")
-    models = {match[1].removesuffix(".md") for match in MODEL_LINK.finditer(markdown)} - {"all", "compare"}
-    if not models or len(models) > 1000 or not any(supported_id(model) for model in models):
-        raise ValueError("Official model directory contains no supported model IDs or changed format")
-    return models
 
 
 def upstream_models(data: bytes) -> dict:
@@ -107,31 +95,24 @@ def model_price(model: str, row: dict) -> dict:
         threshold = metadata["size"]
         if type(threshold) is not int or not 0 < threshold <= 10_000_000:
             raise ValueError("Invalid context-tier threshold")
-        long = {**rates(tier), "threshold": threshold, "source": PRICES_URL}
+        long = {**rates(tier), "threshold": threshold}
         if (base["cache_write"] is None) != (long["cache_write"] is None):
             raise ValueError("Inconsistent cache-write tier prices")
-    return {**base, "long_context": long, "source": PRICES_URL, "model_source": MODEL_URL.format(model)}
+    return {**base, "long_context": long}
 
 
-def collect(markdown: str, data: bytes, warnings: Optional[list[str]] = None) -> dict[str, dict]:
-    official = official_models(markdown)
+def collect(data: bytes, warnings: Optional[list[str]] = None) -> dict[str, dict]:
     upstream = upstream_models(data)
     warnings = warnings if warnings is not None else []
     models = {}
-    # Exact IDs prevent importing another provider's prices or guessing aliases.
-    for model in sorted(official):
+    # Keep each exact OpenAI key; canonical IDs do not rename or merge aliases.
+    for model in sorted(upstream):
         if not supported_id(model):
-            continue
-        if model not in upstream:
-            warnings.append(f"Pending {model}: no matching OpenAI price in models.dev.")
             continue
         try:
             models[model] = model_price(model, upstream[model])
         except UnsupportedPrice as exc:
             warnings.append(f"Pending {model}: {exc}.")
-    for model in sorted(upstream):
-        if supported_id(model) and model not in official:
-            warnings.append(f"Skipped {model}: not listed in the official model directory.")
     if not models:
         raise ValueError("No supported OpenAI models have valid token prices")
     return models
@@ -148,7 +129,7 @@ def updated_catalog(old: dict, observed: dict[str, dict], today: str) -> dict:
         return old
     return {"basis": "standard_api_equivalent", "provider": "openai",
             "verified_at": today if completely_checked else old["verified_at"], "source": PRICES_URL,
-            "model_source": catalog.MODEL_LIST_URL, "models": dict(sorted(models.items()))}
+            "models": dict(sorted(models.items()))}
 
 
 def validate_transition(old: dict, new: dict, observed: Optional[set] = None) -> None:
@@ -189,7 +170,7 @@ def validate_transition(old: dict, new: dict, observed: Optional[set] = None) ->
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--dry-run", action="store_true", help="Check upstream sources without writing prices.json")
+    parser.add_argument("--dry-run", action="store_true", help="Check models.dev without writing prices.json")
     parser.add_argument("--output", type=Path, default=CATALOG, help="Write the validated candidate to this path")
     parser.add_argument("--validate", type=Path, help="Validate a candidate without network access or writes")
     args = parser.parse_args()
@@ -200,7 +181,7 @@ def main() -> int:
         print("Price candidate is valid")
         return 0
     warnings = []
-    observed = collect(fetch(MODELS_URL).decode("utf-8"), fetch(PRICES_URL), warnings)
+    observed = collect(fetch(PRICES_URL), warnings)
     missing = old["models"].keys() - observed.keys()
     if missing:
         warnings.append("Retained unchecked models; source-check date will not advance: " + ", ".join(sorted(missing)))

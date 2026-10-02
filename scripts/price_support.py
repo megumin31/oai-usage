@@ -17,7 +17,6 @@ from typing import Any, Optional
 
 UTC = timezone.utc
 MODELS_DEV_URL = "https://models.dev/api.json"
-MODEL_LIST_URL = "https://developers.openai.com/api/docs/models/all"
 MAX_BYTES = 1_000_000
 RATE = re.compile(r"[0-9]{1,10}(?:\.[0-9]{1,12})?\Z")
 
@@ -29,13 +28,11 @@ class Price:
     output: Decimal
     write: Optional[Decimal] = None
     long_threshold: Optional[int] = None
-    source: str = "custom"
+    source: str = MODELS_DEV_URL
     long_input: Optional[Decimal] = None
     long_cached: Optional[Decimal] = None
     long_write: Optional[Decimal] = None
     long_output: Optional[Decimal] = None
-    model_source: Optional[str] = None
-    rule_source: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -55,13 +52,13 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
 
 
 def validate_download_url(url: str) -> None:
-    if url not in (MODELS_DEV_URL, MODEL_LIST_URL + ".md"):
+    if url != MODELS_DEV_URL:
         raise DownloadError("Price download URL is not allowed")
 
 
 def download_budget(url: str) -> int:
     validate_download_url(url)
-    return 8_000_000 if url == MODELS_DEV_URL else 2_000_000
+    return 8_000_000
 
 
 def _download(url: str, limit: int, socket_timeout: float) -> bytes:
@@ -168,10 +165,10 @@ def exact_keys(value: Any, expected: set) -> None:
 
 
 def parse_price_catalog(raw: Any, origin: str, today: Optional[date] = None) -> PriceCatalog:
-    exact_keys(raw, {"basis", "verified_at", "source", "models", "provider", "model_source"})
+    exact_keys(raw, {"basis", "verified_at", "source", "models", "provider"})
     if raw["basis"] != "standard_api_equivalent":
         raise ValueError("Invalid price catalog basis")
-    if raw["provider"] != "openai" or raw["model_source"] != MODEL_LIST_URL:
+    if raw["provider"] != "openai":
         raise ValueError("Invalid price catalog model provider")
     if raw["source"] != MODELS_DEV_URL:
         raise ValueError("Invalid price catalog upstream source")
@@ -203,31 +200,23 @@ def parse_price_catalog(raw: Any, origin: str, today: Optional[date] = None) -> 
     for model, row in models.items():
         if not isinstance(model, str) or not re.fullmatch(r"[a-z0-9][a-z0-9._-]{0,79}", model):
             raise ValueError("Invalid price catalog model")
-        exact_keys(row, {"input", "cached_input", "cache_write", "output", "long_context", "source", "model_source"})
-        expected_source = "https://developers.openai.com/api/docs/models/" + model
-        if row["model_source"] != expected_source:
-            raise ValueError("Invalid model identity source")
-        if row["source"] != MODELS_DEV_URL:
-            raise ValueError("Invalid model price source")
+        exact_keys(row, {"input", "cached_input", "cache_write", "output", "long_context"})
         long = row["long_context"]
         threshold = None
         if long is not None:
-            exact_keys(long, {"threshold", "input", "cached_input", "cache_write", "output", "source"})
+            exact_keys(long, {"threshold", "input", "cached_input", "cache_write", "output"})
             threshold = long["threshold"]
             if type(threshold) is not int or not 0 < threshold <= 10_000_000:
                 raise ValueError("Invalid long-context rule")
-            if long["source"] != MODELS_DEV_URL:
-                raise ValueError("Invalid long-context rule source")
         write = amount(row["cache_write"], True)
         long_write = amount(long["cache_write"], True) if long else None
         if long and (write is None) != (long_write is None):
             raise ValueError("Inconsistent cache-write rates")
         prices[model] = Price(amount(row["input"]), amount(row["cached_input"], True), amount(row["output"]),
-                              write, threshold, row["source"],
+                              write, threshold, MODELS_DEV_URL,
                               amount(long["input"]) if long else None,
                               amount(long["cached_input"], True) if long else None,
-                              long_write, amount(long["output"]) if long else None,
-                              row["model_source"], long["source"] if long else None)
+                              long_write, amount(long["output"]) if long else None)
     return PriceCatalog(prices, verified_at, origin)
 
 

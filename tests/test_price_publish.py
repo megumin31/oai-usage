@@ -64,11 +64,10 @@ class PublishPrices(unittest.TestCase):
             publish.publish(self.candidate)
         self.assertEqual(gh.call_count, 1)
 
-    def test_untrusted_long_context_source_stops_before_publication(self):
-        self.new['models']['gpt-6-sol']['long_context']['source'] = \
-            'https://developers.openai.com/api/docs/models/gpt-6-sol'
+    def test_untrusted_upstream_source_stops_before_publication(self):
+        self.new['source'] = 'https://developers.openai.com/api/docs/pricing'
         self.candidate.write_text(json.dumps(self.new))
-        with patch.object(publish, 'gh') as gh, self.assertRaisesRegex(ValueError, 'rule source'):
+        with patch.object(publish, 'gh') as gh, self.assertRaisesRegex(ValueError, 'upstream source'):
             publish.publish(self.candidate)
         gh.assert_not_called()
 

@@ -220,7 +220,7 @@ class Standalone(unittest.TestCase):
         namespace = runpy.run_path(str(self.installed), run_name='stdin_worker_security')
         cases = (('https://invalid.example/prices.json', 1000, 1),
                  (namespace['PRICE_URL'], namespace['MAX_BYTES'] + 1, 1),
-                 (namespace['MODEL_LIST_URL'] + '.md', 1000, 1),
+                 ('https://developers.openai.com/api/docs/models/all.md', 1000, 1),
                  (namespace['MODELS_DEV_URL'], 1000, 1),
                  (namespace['PRICE_URL'], 1000, 4),
                  (namespace['PRICE_URL'], 1000, 0))
@@ -276,6 +276,24 @@ class Standalone(unittest.TestCase):
         price = next(row for row in json.loads(result.stdout)['prices'] if row['model'] == 'gpt-6-sol')
         self.assertIsNone(price['cached'])
         self.assertIsNone(price['long_cached_input'])
+
+    def test_exact_alias_log_id_is_priced_and_source_is_models_dev(self):
+        sessions = self.sessions()
+        log = sessions / 'session.jsonl'
+        log.write_text(log.read_text().replace('gpt-6-sol', 'gpt-5.6'))
+        current = json.loads((SCRIPT.parent / 'prices.json').read_text())
+        self.assertEqual(current['models']['gpt-5.6'], current['models']['gpt-5.6-sol'])
+        result = self.run_mock_cli('--root', str(sessions), '--quota', 'off', '--days', 'all', '--json',
+                                   price_bytes=json.dumps(current).encode())
+        self.assertEqual(result.returncode, 0, result.stderr)
+        data = json.loads(result.stdout)
+        self.assertEqual(data['summary']['unpriced_models'], [])
+        self.assertEqual(set(data['summary']['by_model']), {'gpt-5.6'})
+        self.assertGreater(data['summary']['by_model_detail']['gpt-5.6']['api_cost_usd'], 0)
+        self.assertEqual(data['pricing']['source'], 'https://models.dev/api.json')
+        for model in data['pricing']['models'].values():
+            self.assertNotIn('model_source', model)
+            self.assertNotIn('rule_source', model)
 
 
 if __name__ == '__main__':

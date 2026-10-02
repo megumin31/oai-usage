@@ -52,15 +52,14 @@ class CatalogSecurity(unittest.IsolatedAsyncioTestCase):
             elif change == 'scope':
                 bad['models']['gpt-5.5']['long_context']['scope'] = 'session'
             else:
-                bad['models']['gpt-5.5']['long_context']['source'] = bad['models']['gpt-5.5']['model_source']
+                bad['model_source'] = 'https://developers.openai.com/api/docs/models/all'
             with self.subTest(change=change), self.assertRaises(ValueError):
                 await self.load(bad)
 
     async def test_producer_output_is_consumed_with_identical_rates(self):
         from scripts import update_prices as sync
         fixtures = FIXTURE.parent
-        observed = sync.collect((fixtures / 'openai-models-20260926.md').read_text(),
-                                (fixtures / 'models-dev-openai-20260926.json').read_bytes())
+        observed = sync.collect((fixtures / 'models-dev-openai-20260926.json').read_bytes())
         raw = sync.updated_catalog(sample(), observed, M['datetime'].now(M['UTC']).date().isoformat())
         consumer = await self.load(raw)
         production = producer.parse_price_catalog(raw, 'candidate')
@@ -87,7 +86,8 @@ class CatalogSecurity(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(result.origin, 'github')
             self.assertIsNotNone(result.fetched_at)
             self.assertEqual(result.prices['gpt-6-sol'].source, M['MODELS_DEV_URL'])
-            self.assertEqual(M['catalog_info'](result)['model_source'], M['MODEL_LIST_URL'])
+            self.assertEqual(M['catalog_info'](result)['source'], M['MODELS_DEV_URL'])
+            self.assertNotIn('model_source', M['catalog_info'](result))
             self.assertEqual(list(Path(directory).iterdir()), [])
 
     async def test_invalid_provenance_is_rejected(self):
@@ -98,14 +98,15 @@ class CatalogSecurity(unittest.IsolatedAsyncioTestCase):
             bad[key] = value
             with self.subTest(key=key), self.assertRaisesRegex(ValueError, 'Unable to load prices'):
                 await self.load(bad)
-        row = raw['models']['gpt-6-sol']
-        for target, key, value in ((row, 'model_source', 'https://developers.openai.com/api/docs/models/other'),
-                                  (row['long_context'], 'source', 'https://evil.test/api.json')):
-            before = target[key]
-            target[key] = value
+        for key in ('model_source', 'source'):
+            bad = copy.deepcopy(raw)
+            bad['models']['gpt-6-sol'][key] = 'https://developers.openai.com/api/docs/models/other'
             with self.subTest(key=key), self.assertRaises(ValueError):
-                await self.load(raw)
-            target[key] = before
+                await self.load(bad)
+        bad = copy.deepcopy(raw)
+        bad['models']['gpt-6-sol']['long_context']['source'] = 'https://evil.test/api.json'
+        with self.assertRaises(ValueError):
+            await self.load(bad)
 
     async def test_rejects_future_dates_duplicate_keys_nesting_and_bad_numbers(self):
         bad = sample()
@@ -145,7 +146,7 @@ class CatalogSecurity(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(fetch.await_count, 2)
 
     async def test_consumer_rejects_upstream_urls_and_expanded_budgets_before_spawn(self):
-        for url in (M['MODELS_DEV_URL'], M['MODEL_LIST_URL'] + '.md',
+        for url in (M['MODELS_DEV_URL'], 'https://developers.openai.com/api/docs/models/all.md',
                     'https://evil.example/', M['PRICE_URL'] + '?x=1'):
             with self.subTest(url=url), self.assertRaises(M['DownloadError']), \
                     patch.dict(G, {'start_process': AsyncMock()}) as globals_:
@@ -158,7 +159,7 @@ class CatalogSecurity(unittest.IsolatedAsyncioTestCase):
 
 class DownloadSecurity(unittest.TestCase):
     def test_worker_rejects_upstream_urls_and_redirects(self):
-        for url in (M['MODELS_DEV_URL'], M['MODEL_LIST_URL'] + '.md',
+        for url in (M['MODELS_DEV_URL'], 'https://developers.openai.com/api/docs/models/all.md',
                     'https://evil.example/', M['PRICE_URL'] + '?x=1'):
             with self.subTest(url=url), self.assertRaises(W.DownloadError):
                 W._download(url, 1000, 1)

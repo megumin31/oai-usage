@@ -2,7 +2,7 @@
 
 简体中文 | [English](./README.en.md)
 
-`oai-usage` 是一个本地运行的命令行工具，用于汇总 Codex session 日志中的 token 用量、按当前公开 Standard API 单价计算等价成本，并显示账户额度信息。
+`oai-usage` 是一个本地运行的命令行工具，用于汇总 Codex session 日志中的 token 用量、按第三方 models.dev 中 OpenAI 的 Standard API 报价估算等价成本，并显示账户额度信息。
 
 - 只维护最新版稳定 Python 3；只使用标准库，无需安装第三方依赖。运行脚本时，所用的 `python3` 或 `python` 应指向当前最新版稳定 Python 3。
 - 原始 JSONL 日志只读；工具不保留会话正文，不上传日志，也不会读取凭据内容或消耗额度重置次数。
@@ -95,9 +95,9 @@ oai-usage --version
 python3 -W error::ResourceWarning -m unittest discover -s tests -q
 ```
 
-CLI 直接维护在 [`oai-usage`](./oai-usage)，无需构建或重建生成区；用户安装仍只需这一个文件。它只消费 GitHub 固定地址的成品 [`prices.json`](./prices.json)，不下载上游模型目录或价格数据。Actions 生产端由 [`scripts/update_prices.py`](./scripts/update_prices.py) 与独立的同步支持模块 [`scripts/price_support.py`](./scripts/price_support.py) 维护，发布脚本通过更新脚本引用该模块；生产端不依赖或从 CLI 加载代码，`price_support.py` 也不是用户安装依赖。原 `oai_price_catalog.py` 和 `scripts/bundle_prices.py` 已删除。
+CLI 直接维护在 [`oai-usage`](./oai-usage)，无需构建或重建生成区；用户安装仍只需这一个文件。它只消费 GitHub 固定地址的成品 [`prices.json`](./prices.json)，不下载上游模型目录或价格数据。Actions 生产端由 [`scripts/update_prices.py`](./scripts/update_prices.py) 与独立的同步支持模块 [`scripts/price_support.py`](./scripts/price_support.py) 维护，发布脚本通过更新脚本引用该模块；生产端只请求一次 `https://models.dev/api.json`，读取 `openai.models` 的准确模型 ID，不依赖 OpenAI 官网目录；生产端不依赖或从 CLI 加载代码，`price_support.py` 也不是用户安装依赖。原 `oai_price_catalog.py` 和 `scripts/bundle_prices.py` 已删除。
 
-本机 macOS 的 Python 3.14.7 已通过 136 项测试和 diff 检查，覆盖单文件复制、标准输入执行、异步管道及清理、客户端唯一下载地址、生产端独立运行、生产输出与消费结果费率一致，以及旧字段拒绝。本轮真实原生 app-server watch 使用当前格式的本地价格测试样本，连续三帧取得 `app_server` 额度和可用周期预测，退出后两个额度子进程全部回收；这不是新版真实 GitHub 价格下载通过的证据。此前真实 GitHub 下载验证发生在格式调整之前，当前公网价格表仍含旧字段，新版客户端会拒绝；本轮尚未发布，须将程序与价格表一起发布后再验证公网链路。尚无 Windows 实机账户或原生控制台 Ctrl+C 验证，安装类型也未全部实测。在已安装并登录原生 Codex、且云端价格表已同步发布的 Windows 上，可用 PowerShell 验证：
+本机 macOS 的 Python 3.14.7 已通过 141 项全量测试、32 项生产端定向测试、`python3 scripts/update_prices.py --validate prices.json` 和 diff 检查；客户端与生产端解析器对当前 14 个模型逐字段一致。本轮生产端实际只下载一次 models.dev，从 53 条 OpenAI 模型记录筛选出 14 个模型，新增 `gpt-5.6`，原 13 个模型的费率与档位未变；全部既有模型均已观察到，`verified_at` 更新为 2026-10-02。没有请求官网目录、模型 API 或执行发布。此前真实原生 app-server watch 使用当时格式的本地价格测试样本，连续三帧取得 `app_server` 额度和可用周期预测，退出后两个额度子进程全部回收；该额度证据不代表当前成品字段的真实 GitHub 下载已通过。当前格式的公网链路仍待程序与云端价格表配套发布后验证，本轮尚未发布。尚无 Windows 实机账户或原生控制台 Ctrl+C 验证，安装类型也未全部实测。在已安装并登录原生 Codex、且云端价格表已同步发布的 Windows 上，可用 PowerShell 验证：
 
 ```powershell
 python ./oai-usage --quota live --json
@@ -120,7 +120,7 @@ python ./oai-usage watch --quota live --count 3 --json
 
 ## 成本、价格与额度
 
-报告中的“API 等价成本”是按当前公开的 Standard API 单价换算的估计，**不是历史账单，也不是订阅账单**。价格表来自公开仓库 `main/prices.json`；运行 `prices` 可查看模型价格、长上下文规则、最近核对日期和当前目录来源。
+报告中的“API 等价成本”使用第三方 models.dev 中 OpenAI provider 的 Standard API 报价估算，**不是历史账单，也不是订阅账单**。模型 ID 和价格均来自 models.dev，不表示已通过 OpenAI 官网核实身份或单价。客户端从公开仓库 `main/prices.json` 获取成品表，不直连 models.dev；运行 `prices` 可查看模型价格、长上下文规则、最近数据检查日期和当前目录来源。
 
 每次启动 `report`、`watch` 或 `prices` 时，工具会从固定 HTTPS 地址的公开仓库 `main/prices.json` 下载并严格校验价格表，仅在进程内存中使用，不在本地保存。`verified_at` 必须是 UTC 当天或更早日期。客户端下载上限为 1MB、socket 3 秒、总计 6 秒，并限制大小、格式、字段，拒绝重定向或不完整数据。客户端只允许成品价格表的固定下载地址；文件执行和标准输入执行共用同一份固定、最小的下载 worker 源码，由异步调度层管理独立子进程。`watch` 每小时在后台重新下载，不阻塞正常界面刷新；整表下载并校验成功后才切换，每帧使用一份完整的价格表和额度快照。刷新失败时会给出提示，并继续使用本轮最后一份有效价格表；成功恢复后清除刷新失败提示，退出后即丢弃价格表。
 
@@ -134,13 +134,13 @@ python ./oai-usage watch --quota live --count 3 --json
 
 参数格式为 `MODEL=IN,CACHED,OUT[,WRITE]`；四项都是每百万 tokens 的美元单价，`WRITE` 可选，所有值必须是有限的非负数。模型按日志中的准确 ID 计价；`--price` 也必须使用准确 ID。名称如 `astra`、日期后缀、`preview` 或 `latest` 不会自动映射到其他模型，显式定义的自定义模型价格仍可使用。
 
-仓库的 GitHub Actions 配置为每 4 小时运行一次（每日 6 次，UTC 00:17、04:17、08:17、12:17、16:17、20:17；北京时间同为 00:17、04:17、08:17、12:17、16:17、20:17），也支持手动触发；GitHub 的定时调度可能延迟。任务从 OpenAI 官方模型目录提取模型页面 ID，再与 `models.dev/api.json` 中的 `openai.models` 精确匹配。官方目录用于模型身份，`models.dev` 用于价格；两者匹配不需要 API Key。Actions 对官方目录下载上限为 2MB、对 `models.dev` 为 8MB，二者均为 socket 5 秒、每源总计 20 秒，并拒绝重定向。同步范围为 GPT 5.4+、具备文本输出及文本/图像/PDF 输入能力、且同时给出输入和输出单价的模型；缓存读取和写入价格可为空。日期、`preview`、`latest` 等名称后缀不能用于猜测导入，新命名需要检查。
+仓库的 GitHub Actions 配置为每 4 小时运行一次（每日 6 次，UTC 00:17、04:17、08:17、12:17、16:17、20:17；北京时间同为 00:17、04:17、08:17、12:17、16:17、20:17），也支持手动触发；GitHub 的定时调度可能延迟。生产端只请求一次 `https://models.dev/api.json`，按顶层 `openai.models` 的准确 key 读取模型记录与价格，不下载官网目录，不需要 API Key。其他 provider 的同名报价不会导入。Actions 单源下载上限为 8MB、socket 5 秒、总计 20 秒，并拒绝重定向。同步范围为 GPT 5.4+、具备文本输出及文本/图像/PDF 输入能力、且同时给出输入和输出单价的模型；缓存读取和写入价格可为空。日期、`preview`、`latest` 等名称后缀不能用于猜测导入，新命名需要检查。`canonical_model_id` 仅为上游元数据，不用于改名或去重；当前成品表同时保留 `gpt-5.6` 和 `gpt-5.6-sol`，两者价格字段相同，客户端仍按日志中的准确 ID 计价，不增加别名映射。
 
-长上下文只接受 `models.dev` 中唯一、明确的 context tier：直接用 `tier.size` 作为阈值，按本工具的 request 范围计价，并将 `models.dev` 记为规则数据来源。request 是唯一计价规则，价格表不提供可选 scope。新模型有有效的显式 tier 即可自动导入，不需逐型号本地规则；只有旧 `context_over_200k` 而没有显式阈值、多档价格或未知定价维度时仍保持 pending，不猜测或补零。未匹配、缺少必需单价或不支持的模型会记录在 Actions 日志；已有模型保留其历史价格。
+长上下文只接受 `models.dev` 中唯一、明确的 context tier：直接用 `tier.size` 作为阈值，按本工具的 request 范围计价，规则同样来自该单一上游。request 是唯一计价规则，价格表不提供可选 scope。新模型有有效的显式 tier 即可自动导入，不需逐型号本地规则；只有旧 `context_over_200k` 而没有显式阈值、多档价格或未知定价维度时仍保持 pending，不猜测或补零。缺少必需单价或不支持的模型会记录在 Actions 日志；已有模型保留其历史价格。
 
 只在本仓库 `main` 上运行的只读校验任务生成仅含 JSON 的候选表；独立发布任务以受信任代码再次校验后，才通过 GitHub API 在一个 `expectedHeadOid` 下原子更新固定的 `prices.json` 路径。候选必须符合当前价格表字段，顶层 `source` 固定为 `models.dev`，不能包含代码。解析、测试或候选价格异常都会停止发布：包括任何已有模型删除、大批模型消失、新模型任一存在费率为零、已有模型零价状态变化、单价剧烈变化或长上下文阈值变化；已有费率丢失也会停止，原先缺失的可选缓存费率变为有效正费率则可自动更新。此时请人工核对上游价格，并修订基准价格后重新运行；没有自动放行开关。
 
-解析和测试均成功时，价格变化会立即提交；但只有本轮已检查目录中的全部既有模型的上游名单和价格时，`verified_at` 才能前推。若有既有模型未在本轮观察到，工具会保留其价格并在 Actions 日志列出具体模型，且即使其余模型价格变化或已满 30 天，也不会前推整个目录的核对日期。全部既有模型均已检查且价格未变时，`verified_at` 满 30 天才会仅刷新该日期并提交，以维持公开仓库的定时任务活动；未满 30 天则不提交。`verified_at` 表示本轮上游价格和模型名单的检查日期，不能证明官方核价或本地长上下文规则已经重新审核。该机制仍信任该 GitHub 仓库及其发布流程：目录和来源字段没有签名，不能独自证明真实价格；发布写入权限也是仓库级别，不能限定到单一路径。
+解析和测试均成功时，价格变化会立即提交；但只有本轮已检查目录中的全部既有模型的上游记录和价格时，`verified_at` 才能前推。若有既有模型未在本轮观察到，工具会保留其价格并在 Actions 日志列出具体模型，且即使其余模型价格变化或已满 30 天，也不会前推整个目录的核对日期。全部既有模型均已检查且价格未变时，`verified_at` 满 30 天才会仅刷新该日期并提交，以维持公开仓库的定时任务活动；未满 30 天则不提交。`verified_at` 表示本轮 models.dev 模型记录与价格的检查日期，不能证明官方核价或本地长上下文规则已经重新审核。该机制仍信任该 GitHub 仓库及其发布流程：目录和来源字段没有签名，不能独自证明真实价格；发布写入权限也是仓库级别，不能限定到单一路径。
 
 未知模型不会套用其他模型的价格。若单次请求输入量缺失，累计增量又超过长上下文阈值，或最后一次请求详情互相矛盾，该事件的档位未知；累计增量不超过阈值且详情无冲突时，可以确定其中的请求都属于短档。有缓存读取 token 但缺少对应单价时，已知费用仍可计算，但总成本标为不完整。因此：
 
@@ -173,7 +173,11 @@ python ./oai-usage watch --quota live --count 3 --json
 
 持续刷新时，`ReportCache` 会复用未变化日志的会话、计价和汇总结果；滑动时间窗口只有跨过用量事件边界时才重新汇总。
 
-顶层报告 JSON 包含 `version`、`generated_at`、`period`、`roots`、`pricing`、`diagnostics`、`summary` 和 `sessions`。`pricing` 包含价格表的 `verified_at`、`catalog_source`（运行时仅为 `github`）、本次下载时间 `fetched_at`、陈旧标记 `stale` 与提示 `warnings`，以及顶层的价格来源 `price_source` 和模型身份来源 `model_source`；每个模型同层包含 `model_source` 和 `rule_source`，并保留普通单价和 `long_input`、`long_cached_input`、`long_cache_write`、`long_output` 长上下文单价字段。`cached_input` 和 `long_cached_input` 可为 `null`。价格表超过 45 天未检查时会标为陈旧并给出提示。`prices --json` 同样返回这些目录元数据和每模型价格字段。`prices.json` 只接受当前字段：顶层 `provider` 为 `openai`、`model_source` 为官方模型目录，`source` 严格为 `models.dev` 的价格来源；每个模型的 `model_source` 必须是对应的官方模型页，长上下文 `long_context.source` 只接受 `models.dev`，输出的 `rule_source` 同样为 `models.dev`，无长上下文时 `rule_source` 为 `null`。这些来源字段表示数据出处，不代表签名或官方核价。`summary` 保留常用的 `usage`、`by_model`、`by_day`、`by_session`、`unpriced_usage` 与 `api_cost_usd` 语义，并新增 `known_api_cost_usd`、`estimate_is_partial`、`uncertain_pricing_usage`、`pricing_issues`；每个 session 可包含 `parent_session_id`。价格表和报告不包含 `schema_version`，也不设置替代版本号；价格表不接受旧 `long_context.scope` 字段，报告与 `prices` 输出不包含 `long_context_scope`，长上下文统一按 request 计价。只维护当前格式，无旧格式回退或迁移兼容；参数不接受缩写或旧别名。
+顶层报告 JSON 包含 `version`、`generated_at`、`period`、`roots`、`pricing`、`diagnostics`、`summary` 和 `sessions`。`pricing` 包含价格表的 `verified_at`、`catalog_source`（运行时为 `github`，表示成品表下载位置）、本次下载时间 `fetched_at`、陈旧标记 `stale` 与提示 `warnings`，以及统一的上游来源 `source`（`https://models.dev/api.json`，表示模型 ID 和价格均来自 models.dev）。每个模型保留普通单价和 `long_input`、`long_cached_input`、`long_cache_write`、`long_output` 长上下文单价字段；模型输出的 `source` 为 models.dev 地址，手动覆盖时为 `custom`。`cached_input` 和 `long_cached_input` 可为 `null`。价格表超过 45 天未检查时会标为陈旧并给出提示。`prices --json` 同样返回目录元数据和每模型价格字段。
+
+成品 `prices.json` 只接受当前字段：顶层为 `basis`、`provider`、`verified_at`、`source`、`models`，其中 `provider` 固定为 `openai`，`source` 固定为 `https://models.dev/api.json`；每个模型行仅包含 `input`、`cached_input`、`cache_write`、`output`、`long_context`，非空 `long_context` 仅包含 `threshold`、`input`、`cached_input`、`cache_write`、`output`。成品表不含逐模型或长上下文来源字段；输出不包含 `price_source`、`model_source` 或 `rule_source`，统一使用 `source`。来源字段表示数据出处，不代表签名、官方模型身份核验或官方核价。
+
+`summary` 保留 `usage`、`by_model`、`by_day`、`by_session`、`unpriced_usage`、`api_cost_usd`、`known_api_cost_usd`、`estimate_is_partial`、`uncertain_pricing_usage` 和 `pricing_issues`；每个 session 可包含 `parent_session_id`。价格表和报告不包含 `schema_version`，也不设置替代版本号；价格表不接受旧 `long_context.scope` 字段，报告与 `prices` 输出不包含 `long_context_scope`，长上下文统一按 request 计价。只维护当前格式，无旧格式回退或迁移兼容；参数不接受缩写或旧别名。
 
 ## 数据质量提示
 
