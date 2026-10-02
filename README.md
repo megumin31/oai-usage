@@ -2,11 +2,37 @@
 
 `oai-usage` 是一个本地运行的命令行工具，用于汇总 Codex session 日志中的 token 用量、按当前公开 Standard API 单价计算等价成本，并显示账户额度信息。
 
-- 只维护最新版稳定 Python 3；只使用标准库，无需安装第三方依赖。运行脚本时，`python3` 应指向当前最新版稳定 Python 3。
+- 只维护最新版稳定 Python 3；只使用标准库，无需安装第三方依赖。运行脚本时，所用的 `python3` 或 `python` 应指向当前最新版稳定 Python 3。
 - 原始 JSONL 日志只读；工具不保留会话正文，不上传日志，也不会读取凭据内容或消耗额度重置次数。
 - 安装时只需复制 [`oai-usage`](./oai-usage) 一个文件；它已内置价格处理代码，运行时从 GitHub 获取价格表。当前版本为 0.0.1；程序提供的 CLI、报告、诊断和 JSON 说明文字使用英文，日志中的模型名等用户数据保持原样。
 
 ## 快速开始
+
+可以直接拉取执行：通过 `curl` 下载单文件 CLI，再由最新版稳定 Python 3 从标准输入执行，无需持久安装或临时脚本。macOS、Linux 或 WSL 使用：
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/megumin31/oai-usage/main/oai-usage | python3 -
+
+# 带参数运行：参数放在 Python 的 - 后
+curl -fsSL https://raw.githubusercontent.com/megumin31/oai-usage/main/oai-usage | python3 - --today
+curl -fsSL https://raw.githubusercontent.com/megumin31/oai-usage/main/oai-usage | python3 - watch --quota logs --count 3
+
+# 查看版本或帮助
+curl -fsSL https://raw.githubusercontent.com/megumin31/oai-usage/main/oai-usage | python3 - --version
+curl -fsSL https://raw.githubusercontent.com/megumin31/oai-usage/main/oai-usage | python3 - --help
+```
+
+Windows 使用 PowerShell 7.4+，并安装最新版稳定 Python 3：
+
+```powershell
+curl -fsSL https://raw.githubusercontent.com/megumin31/oai-usage/main/oai-usage | python -
+curl -fsSL https://raw.githubusercontent.com/megumin31/oai-usage/main/oai-usage | python - --today
+curl -fsSL https://raw.githubusercontent.com/megumin31/oai-usage/main/oai-usage | python - watch --count 3
+```
+
+`python3` 和 `python` 是不同平台常见的解释器名称；如果 Linux 上的 `python` 也指向所需的 Python 3，同一条 `curl ... | python -` 命令也可使用。标准输入执行保留本地执行的 CLI 参数、JSON 和 `--output` 规则，生成报告仍须联网获取价格表。
+
+Windows 实时额度查询的管道兼容问题尚未解决；默认 `--quota auto` 在实时查询失败后会回退到日志快照，也可显式使用 `--quota logs` 或 `--quota off`。命名时区所需的数据也尚未补齐，因此此入口不代表所有 Windows 功能已完整支持。
 
 直接运行脚本：
 

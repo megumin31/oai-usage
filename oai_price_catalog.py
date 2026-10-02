@@ -93,6 +93,10 @@ def _download(url: str, limit: int, socket_timeout: float) -> bytes:
         return bytes(data)
 
 
+# Filled from this module's download implementation by scripts/bundle_prices.py.
+STDIN_DOWNLOAD_WORKER = None
+
+
 def fetch_https(url: str, limit: int = MAX_BYTES, total_timeout: float = 6,
                 socket_timeout: float = 3) -> bytes:
     validate_download_url(url)
@@ -100,7 +104,13 @@ def fetch_https(url: str, limit: int = MAX_BYTES, total_timeout: float = 6,
         raise ValueError("Invalid price download limits")
     # A separate, fixed local worker lets the parent terminate DNS, TLS, and slow
     # reads together. Socket timeouts alone cannot bound the whole operation.
-    command = [sys.executable, str(Path(__file__).resolve()), "--download", url, str(limit), str(socket_timeout)]
+    arguments = ["--download", url, str(limit), str(socket_timeout)]
+    if __file__ == "<stdin>":
+        if STDIN_DOWNLOAD_WORKER is None:
+            raise DownloadError("Streaming requires the standalone oai-usage script")
+        command = [sys.executable, "-c", STDIN_DOWNLOAD_WORKER, *arguments]
+    else:
+        command = [sys.executable, str(Path(__file__).resolve()), *arguments]
     try:
         result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=total_timeout)
     except subprocess.TimeoutExpired:

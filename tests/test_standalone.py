@@ -9,6 +9,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from unittest.mock import Mock, patch
 
@@ -43,6 +44,19 @@ class Standalone(unittest.TestCase):
         return subprocess.run([sys.executable, '-c', BOOTSTRAP, str(self.installed), *args],
                               cwd=self.root, env=self.env, input=raw.decode(),
                               capture_output=True, text=True, timeout=10)
+
+    def run_stdin_cli(self, *args, price_bytes=None):
+        source = self.installed.read_text(encoding='utf-8')
+        if price_bytes is not None:
+            namespace = runpy.run_path(str(self.installed), run_name='stdin_transport_fixture')
+            # Keep the real subprocess transport; only replace HTTPS in its worker.
+            worker = namespace['STDIN_DOWNLOAD_WORKER'].removesuffix('download_main()\n')
+            worker += f'\n_download = lambda *args: {price_bytes!r}\ndownload_main()\n'
+            entry = '\nif __name__ == "__main__":\n'
+            source = source.replace(entry, f'\nSTDIN_DOWNLOAD_WORKER = {worker!r}\n' + entry)
+        return subprocess.run([sys.executable, '-X', 'utf8', '-', *args], input=source,
+                              cwd=self.root, env=self.env, capture_output=True, text=True,
+                              encoding='utf-8', timeout=10)
 
     def test_one_file_version_help_and_live_prices_without_disk_cache(self):
         for args in (('--version',), ('--help',)):
@@ -140,7 +154,74 @@ class Standalone(unittest.TestCase):
                 self.assertIn('unrecognized arguments', result.stderr)
 
     def test_checked_in_executable_matches_source(self):
-        self.assertEqual(SCRIPT.read_text(), bundled_script())
+        self.assertEqual(SCRIPT.read_text(encoding='utf-8'), bundled_script())
+
+    def test_stdin_version_help_and_prices_without_script_or_cache_files(self):
+        for args in (('--version',), ('--help',), ('watch', '--help')):
+            with self.subTest(args=args):
+                result = self.run_stdin_cli(*args)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn('oai-usage', result.stdout)
+        result = self.run_stdin_cli('prices', '--json', price_bytes=FIXTURE.read_bytes())
+        self.assertEqual(result.returncode, 0, result.stderr)
+        data = json.loads(result.stdout)
+        self.assertEqual(data['catalog_source'], 'github')
+        self.assertTrue(data['prices'])
+        self.assertEqual([path.name for path in self.root.iterdir()], ['bin'])
+
+    def test_stdin_report_watch_arguments_and_output_protection(self):
+        sessions = self.sessions().rename(self.root / '中文 sessions')
+        common = ('--root', str(sessions), '--quota', 'off', '--days', 'all', '--json')
+        result = self.run_stdin_cli(*common, price_bytes=FIXTURE.read_bytes())
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(result.stdout)['summary']['usage']['total_tokens'], 120)
+        watched = self.run_stdin_cli('watch', '--count', '2', '--refresh', '.05', *common,
+                                     price_bytes=FIXTURE.read_bytes())
+        self.assertEqual(watched.returncode, 0, watched.stderr)
+        frames = [json.loads(line) for line in watched.stdout.splitlines()]
+        self.assertEqual(len(frames), 2)
+        self.assertTrue(all(frame['summary']['usage']['total_tokens'] == 120 for frame in frames))
+        output = self.root / 'report.json'
+        saved = self.run_stdin_cli(*common, '--output', str(output), price_bytes=FIXTURE.read_bytes())
+        self.assertEqual(saved.returncode, 0, saved.stderr)
+        self.assertEqual(json.loads(output.read_text(encoding='utf-8')), json.loads(saved.stdout))
+        log = sessions / 'session.jsonl'
+        before = log.read_bytes()
+        rejected = self.run_stdin_cli(*common, '--output', str(log), price_bytes=FIXTURE.read_bytes())
+        self.assertEqual(rejected.returncode, 1)
+        self.assertEqual(log.read_bytes(), before)
+        self.assertFalse((self.root / 'cache').exists())
+
+    def test_stdin_invalid_prices_exit_without_disk_fallback(self):
+        result = self.run_stdin_cli('prices', '--json', price_bytes=b'invalid prices')
+        self.assertEqual(result.returncode, 1)
+        self.assertEqual(result.stdout, '')
+        self.assertIn('Unable to load prices from GitHub', result.stderr)
+        self.assertEqual([path.name for path in self.root.iterdir()], ['bin'])
+
+    def test_embedded_worker_rejects_invalid_urls_and_limits(self):
+        namespace = runpy.run_path(str(self.installed), run_name='stdin_worker_security')
+        cases = (('https://invalid.example/prices.json', 1000, 1),
+                 (namespace['PRICE_URL'], namespace['MAX_BYTES'] + 1, 1),
+                 (namespace['MODEL_LIST_URL'] + '.md', 2_000_001, 1),
+                 (namespace['PRICE_URL'], 1000, 0))
+        for url, limit, timeout in cases:
+            with self.subTest(url=url, limit=limit, timeout=timeout):
+                result = subprocess.run([sys.executable, '-c', namespace['STDIN_DOWNLOAD_WORKER'],
+                                         '--download', url, str(limit), str(timeout)],
+                                        capture_output=True, text=True, timeout=5)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual(result.stdout, '')
+                self.assertIn('Price download failed', result.stderr)
+
+    def test_stdin_worker_total_timeout_is_enforced(self):
+        namespace = runpy.run_path(str(self.installed), run_name='stdin_worker_timeout')
+        globals_ = namespace['fetch_https'].__globals__
+        start = time.monotonic()
+        with patch.dict(globals_, {'__file__': '<stdin>', 'STDIN_DOWNLOAD_WORKER': 'import time; time.sleep(30)'}), \
+                self.assertRaisesRegex(namespace['DownloadError'], 'total time limit'):
+            namespace['fetch_https'](namespace['PRICE_URL'], total_timeout=.2, socket_timeout=.1)
+        self.assertLess(time.monotonic() - start, 3)
 
     def test_legacy_cloud_scope_does_not_reprice_an_entire_session(self):
         sessions = self.root / 'sessions'

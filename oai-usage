@@ -115,6 +115,116 @@ def _download(url: str, limit: int, socket_timeout: float) -> bytes:
         return bytes(data)
 
 
+# Filled from this module's download implementation by scripts/bundle_prices.py.
+STDIN_DOWNLOAD_WORKER = (
+    'import json\n'
+    'import os\n'
+    'import re\n'
+    'import subprocess\n'
+    'import sys\n'
+    'import tempfile\n'
+    'import urllib.request\n'
+    'from dataclasses import dataclass, replace\n'
+    'from datetime import date, datetime, timezone\n'
+    'from decimal import Decimal\n'
+    'from http.client import HTTPException\n'
+    'from pathlib import Path\n'
+    'from typing import Any, Optional\n'
+    '\n'
+    'UTC = timezone.utc\n'
+    'PRICE_URL = "https://raw.githubusercontent.com/megumin31/oai-usage/main/prices.json"\n'
+    'MODELS_DEV_URL = "https://models.dev/api.json"\n'
+    'MODEL_LIST_URL = "https://developers.openai.com/api/docs/models/all"\n'
+    'MAX_BYTES = 1_000_000\n'
+    'STALE_DAYS = 45\n'
+    'RATE = re.compile(r"[0-9]{1,10}(?:\\.[0-9]{1,12})?\\Z")\n'
+    '\n'
+    '\n'
+    '@dataclass(frozen=True)\n'
+    'class Price:\n'
+    '    input: Decimal\n'
+    '    cached: Optional[Decimal]\n'
+    '    output: Decimal\n'
+    '    write: Optional[Decimal] = None\n'
+    '    long_threshold: Optional[int] = None\n'
+    '    long_scope: str = "request"\n'
+    '    source: str = "custom"\n'
+    '    long_input: Optional[Decimal] = None\n'
+    '    long_cached: Optional[Decimal] = None\n'
+    '    long_write: Optional[Decimal] = None\n'
+    '    long_output: Optional[Decimal] = None\n'
+    '    model_source: Optional[str] = None\n'
+    '    rule_source: Optional[str] = None\n'
+    '\n'
+    '\n'
+    '@dataclass(frozen=True)\n'
+    'class PriceCatalog:\n'
+    '    prices: dict\n'
+    '    verified_at: str\n'
+    '    origin: str\n'
+    '    fetched_at: Optional[str] = None\n'
+    '    warnings: tuple = ()\n'
+    '    source: Optional[str] = None\n'
+    '    model_source: Optional[str] = None\n'
+    '\n'
+    '\n'
+    'class DownloadError(ValueError):\n'
+    '    pass\n'
+    '\n'
+    '\n'
+    'class NoRedirect(urllib.request.HTTPRedirectHandler):\n'
+    '    def redirect_request(self, req, fp, code, msg, headers, newurl):\n'
+    '        raise DownloadError("Price download redirects are not allowed")\n'
+    '\n'
+    '\n'
+    'def validate_download_url(url: str) -> None:\n'
+    '    if url not in (PRICE_URL, MODELS_DEV_URL, MODEL_LIST_URL + ".md"):\n'
+    '        raise DownloadError("Price download URL is not allowed")\n'
+    '\n'
+    '\n'
+    'def download_budget(url: str) -> int:\n'
+    '    validate_download_url(url)\n'
+    '    return 8_000_000 if url == MODELS_DEV_URL else MAX_BYTES if url == PRICE_URL else 2_000_000\n'
+    '\n'
+    '\n'
+    'def _download(url: str, limit: int, socket_timeout: float) -> bytes:\n'
+    '    validate_download_url(url)\n'
+    '    request = urllib.request.Request(url, headers={"User-Agent": "oai-usage-prices/1.0", "Accept-Encoding": "identity"})\n'
+    '    with urllib.request.build_opener(NoRedirect()).open(request, timeout=socket_timeout) as response:\n'
+    '        if response.status != 200 or response.geturl() != url:\n'
+    '            raise DownloadError("Unexpected price download response")\n'
+    '        if response.headers.get("Content-Encoding", "identity").lower() != "identity":\n'
+    '            raise DownloadError("Compressed price responses are not accepted")\n'
+    '        length = response.headers.get("Content-Length")\n'
+    '        if length is not None and (not length.isdecimal() or len(length) > 10 or int(length) > limit):\n'
+    '            raise DownloadError("Price response is too large or has invalid length")\n'
+    '        data = bytearray()\n'
+    '        while len(data) <= limit:\n'
+    '            chunk = response.read(min(65536, limit + 1 - len(data)))\n'
+    '            if not chunk:\n'
+    '                break\n'
+    '            data.extend(chunk)\n'
+    '        if len(data) > limit or (length is not None and len(data) != int(length)):\n'
+    '            raise DownloadError("Price response is oversized or incomplete")\n'
+    '        return bytes(data)\n'
+    '\n'
+    '\n'
+    'def download_main() -> None:\n'
+    '    if len(sys.argv) != 5 or sys.argv[1] != "--download":\n'
+    '        raise SystemExit("This module is loaded by oai-usage; it is not a standalone command")\n'
+    '    try:\n'
+    '        download_limit, read_timeout = int(sys.argv[3]), float(sys.argv[4])\n'
+    '        if not 0 < download_limit <= download_budget(sys.argv[2]) or not 0 < read_timeout <= 60:\n'
+    '            raise ValueError("Invalid download limits")\n'
+    '        sys.stdout.buffer.write(_download(sys.argv[2], download_limit, read_timeout))\n'
+    '    except (OSError, ValueError, HTTPException):\n'
+    '        raise SystemExit("Price download failed")\n'
+    '\n'
+    '\n'
+    'download_main()\n'
+)
+
+
 def fetch_https(url: str, limit: int = MAX_BYTES, total_timeout: float = 6,
                 socket_timeout: float = 3) -> bytes:
     validate_download_url(url)
@@ -122,7 +232,13 @@ def fetch_https(url: str, limit: int = MAX_BYTES, total_timeout: float = 6,
         raise ValueError("Invalid price download limits")
     # A separate, fixed local worker lets the parent terminate DNS, TLS, and slow
     # reads together. Socket timeouts alone cannot bound the whole operation.
-    command = [sys.executable, str(Path(__file__).resolve()), "--download", url, str(limit), str(socket_timeout)]
+    arguments = ["--download", url, str(limit), str(socket_timeout)]
+    if __file__ == "<stdin>":
+        if STDIN_DOWNLOAD_WORKER is None:
+            raise DownloadError("Streaming requires the standalone oai-usage script")
+        command = [sys.executable, "-c", STDIN_DOWNLOAD_WORKER, *arguments]
+    else:
+        command = [sys.executable, str(Path(__file__).resolve()), *arguments]
     try:
         result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=total_timeout)
     except subprocess.TimeoutExpired:
@@ -1680,7 +1796,9 @@ def main(argv: Optional[list] = None) -> int:
                 next_price_refresh = tick + 3600
             data = report(args, scanner, prices, calendar, roots, poller, cache, price_catalog)
             if args.output and args.output != "-":
-                protected = {Path(__file__).resolve()} | set(scanner.cache)
+                protected = set(scanner.cache)
+                if __file__ != "<stdin>":
+                    protected.add(Path(__file__).resolve())
                 write_json(Path(args.output), data, protected)
             if json_stdout:
                 print(json.dumps(data, ensure_ascii=False, allow_nan=False,
