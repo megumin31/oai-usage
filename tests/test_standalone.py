@@ -1,4 +1,5 @@
 """Exercise one installed script with live prices supplied by a transport fixture."""
+import asyncio
 import contextlib
 import io
 import json
@@ -13,13 +14,15 @@ import time
 import unittest
 from unittest.mock import Mock, patch
 
-from scripts.bundle_prices import SCRIPT, bundled_script
+SCRIPT = Path(__file__).resolve().parents[1] / "oai-usage"
 
 FIXTURE = Path(__file__).parent / 'fixtures/prices.json'
 BOOTSTRAP = '''import runpy, sys
 raw = sys.stdin.buffer.read()
 namespace = runpy.run_path(sys.argv[1], run_name="standalone_cli_test")
-namespace["main"].__globals__["fetch_https"] = lambda *args: raw
+async def fetch(*args):
+    return raw
+namespace["main"].__globals__["fetch_https_async"] = fetch
 raise SystemExit(namespace["main"](sys.argv[2:]))
 '''
 
@@ -50,10 +53,11 @@ class Standalone(unittest.TestCase):
         if price_bytes is not None:
             namespace = runpy.run_path(str(self.installed), run_name='stdin_transport_fixture')
             # Keep the real subprocess transport; only replace HTTPS in its worker.
-            worker = namespace['STDIN_DOWNLOAD_WORKER'].removesuffix('download_main()\n')
+            worker = namespace['DOWNLOAD_WORKER'].rsplit('\nif __name__ == "__main__":', 1)[0]
             worker += f'\n_download = lambda *args: {price_bytes!r}\ndownload_main()\n'
             entry = '\nif __name__ == "__main__":\n'
-            source = source.replace(entry, f'\nSTDIN_DOWNLOAD_WORKER = {worker!r}\n' + entry)
+            prefix, suffix = source.rsplit(entry, 1)
+            source = prefix + f'\nDOWNLOAD_WORKER = {worker!r}\n' + entry + suffix
         return subprocess.run([sys.executable, '-X', 'utf8', '-', *args], input=source,
                               cwd=self.root, env=self.env, capture_output=True, text=True,
                               encoding='utf-8', timeout=10)
@@ -122,29 +126,39 @@ class Standalone(unittest.TestCase):
         sessions = self.sessions()
         namespace = runpy.run_path(str(self.installed), run_name='standalone_watch')
         globals_ = namespace['main'].__globals__
-        fetch = Mock(side_effect=[FIXTURE.read_bytes(), OSError('offline')])
-        with patch.dict(globals_, {'fetch_https': fetch}), \
-                patch.object(namespace['time'], 'monotonic', side_effect=[0, 0, 0, 3601]), \
-                patch.object(namespace['time'], 'sleep'), contextlib.redirect_stdout(io.StringIO()) as output:
+        initial = namespace['parse_price_catalog'](json.loads(FIXTURE.read_bytes()), 'github')
+        calls = []
+        async def fetch():
+            calls.append(True)
+            if len(calls) == 1:
+                return initial
+            raise OSError('offline')
+        real_sleep = asyncio.sleep
+        async def fast_sleep(delay):
+            await real_sleep(.001 if delay == 3600 else .03)
+        with patch.dict(globals_, {'load_price_catalog_async': fetch}), \
+                patch.object(asyncio, 'sleep', fast_sleep), contextlib.redirect_stdout(io.StringIO()) as output:
             code = namespace['main'](['watch', '--root', str(sessions), '--quota', 'off', '--days', 'all', '--json', '--count', '2'])
         self.assertEqual(code, 0)
         reports = [json.loads(line) for line in output.getvalue().splitlines()]
         self.assertEqual(len(reports), 2)
         self.assertEqual(reports[0]['summary']['api_cost_usd'], reports[1]['summary']['api_cost_usd'])
         self.assertIn('last valid prices in memory', reports[1]['pricing']['warnings'][0])
-        self.assertEqual(fetch.call_count, 2)
+        self.assertGreaterEqual(len(calls), 2)
         self.assertFalse((self.root / 'cache').exists())
 
-    def test_download_worker_runs_from_copied_executable(self):
-        result = self.run_cli('--download', 'https://invalid.example/prices.json', '1000', '1')
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn('Price download failed', result.stderr)
-        namespace = runpy.run_path(str(self.installed), run_name='standalone_download_test')
-        with patch.object(subprocess, 'run') as worker:
-            worker.return_value.returncode = 0
-            worker.return_value.stdout = b'{}'
-            self.assertEqual(namespace['fetch_https'](namespace['PRICE_URL']), b'{}')
-        self.assertEqual(worker.call_args.args[0][:3], [sys.executable, str(self.installed.resolve()), '--download'])
+    def test_same_fixed_worker_runs_from_copied_executable(self):
+        namespace = runpy.run_path(str(self.installed), run_name='copied_worker_fixture')
+        worker = namespace['DOWNLOAD_WORKER'].rsplit('\nif __name__ == "__main__":', 1)[0]
+        worker += f'\n_download = lambda *args: {FIXTURE.read_bytes()!r}\ndownload_main()\n'
+        source = self.installed.read_text(encoding='utf-8')
+        entry = '\nif __name__ == "__main__":\n'
+        prefix, suffix = source.rsplit(entry, 1)
+        self.installed.write_text(prefix + f'\nDOWNLOAD_WORKER = {worker!r}\n' + entry + suffix, encoding='utf-8')
+        result = self.run_cli('prices', '--json')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(json.loads(result.stdout)['prices'])
+        self.assertEqual([p.name for p in self.installed.parent.iterdir()], ['oai-usage'])
 
     def test_offline_and_cache_options_are_removed(self):
         for flag in ('--offline-prices', '--bundled-prices', '--reset-price-cache'):
@@ -153,8 +167,11 @@ class Standalone(unittest.TestCase):
                 self.assertEqual(result.returncode, 2)
                 self.assertIn('unrecognized arguments', result.stderr)
 
-    def test_checked_in_executable_matches_source(self):
-        self.assertEqual(SCRIPT.read_text(encoding='utf-8'), bundled_script())
+    def test_cli_contains_only_price_consumer_interfaces(self):
+        namespace = runpy.run_path(str(self.installed), run_name='consumer_boundary')
+        for name in ('read_limited', 'atomic_write', 'fetch_https', 'load_price_catalog', 'download_budget'):
+            self.assertNotIn(name, namespace)
+        self.assertNotIn('GENERATED PRICE CATALOG', self.installed.read_text(encoding='utf-8'))
 
     def test_stdin_version_help_and_prices_without_script_or_cache_files(self):
         for args in (('--version',), ('--help',), ('watch', '--help')):
@@ -203,11 +220,13 @@ class Standalone(unittest.TestCase):
         namespace = runpy.run_path(str(self.installed), run_name='stdin_worker_security')
         cases = (('https://invalid.example/prices.json', 1000, 1),
                  (namespace['PRICE_URL'], namespace['MAX_BYTES'] + 1, 1),
-                 (namespace['MODEL_LIST_URL'] + '.md', 2_000_001, 1),
+                 (namespace['MODEL_LIST_URL'] + '.md', 1000, 1),
+                 (namespace['MODELS_DEV_URL'], 1000, 1),
+                 (namespace['PRICE_URL'], 1000, 4),
                  (namespace['PRICE_URL'], 1000, 0))
         for url, limit, timeout in cases:
             with self.subTest(url=url, limit=limit, timeout=timeout):
-                result = subprocess.run([sys.executable, '-c', namespace['STDIN_DOWNLOAD_WORKER'],
+                result = subprocess.run([sys.executable, '-c', namespace['DOWNLOAD_WORKER'],
                                          '--download', url, str(limit), str(timeout)],
                                         capture_output=True, text=True, timeout=5)
                 self.assertNotEqual(result.returncode, 0)
@@ -216,14 +235,14 @@ class Standalone(unittest.TestCase):
 
     def test_stdin_worker_total_timeout_is_enforced(self):
         namespace = runpy.run_path(str(self.installed), run_name='stdin_worker_timeout')
-        globals_ = namespace['fetch_https'].__globals__
+        globals_ = namespace['fetch_https_async'].__globals__
         start = time.monotonic()
-        with patch.dict(globals_, {'__file__': '<stdin>', 'STDIN_DOWNLOAD_WORKER': 'import time; time.sleep(30)'}), \
+        with patch.dict(globals_, {'DOWNLOAD_WORKER': 'import time; time.sleep(30)'}), \
                 self.assertRaisesRegex(namespace['DownloadError'], 'total time limit'):
-            namespace['fetch_https'](namespace['PRICE_URL'], total_timeout=.2, socket_timeout=.1)
+            asyncio.run(namespace['fetch_https_async'](namespace['PRICE_URL'], total_timeout=.2, socket_timeout=.1))
         self.assertLess(time.monotonic() - start, 3)
 
-    def test_legacy_cloud_scope_does_not_reprice_an_entire_session(self):
+    def test_short_long_short_requests_are_priced_independently(self):
         sessions = self.root / 'sessions'
         sessions.mkdir()
         rows = [
@@ -240,7 +259,8 @@ class Standalone(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         data = json.loads(result.stdout)
         self.assertEqual(data['summary']['api_cost_usd'], 3.75)
-        self.assertEqual(data['pricing']['models']['gpt-5.5']['long_context_scope'], 'request')
+        self.assertNotIn('long_context_scope', data['pricing']['models']['gpt-5.5'])
+        self.assertNotIn('schema_version', data)
         result = self.run_mock_cli('--root', str(sessions), '--quota', 'off', '--since', '2026-09-22',
                                    '--until', '2026-09-22', '--timezone', 'UTC', '--json')
         self.assertEqual(result.returncode, 0, result.stderr)

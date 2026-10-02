@@ -1,5 +1,4 @@
 {
-  "schema_version": 2,
   "basis": "standard_api_equivalent",
   "provider": "openai",
   "verified_at": "2026-09-26",
@@ -17,8 +16,7 @@
         "cache_write": null,
         "output": "22.5",
         "threshold": 272000,
-        "scope": "session",
-        "source": "https://developers.openai.com/api/docs/models/gpt-5.4"
+        "source": "https://models.dev/api.json"
       },
       "source": "https://models.dev/api.json",
       "model_source": "https://developers.openai.com/api/docs/models/gpt-5.4"
@@ -52,8 +50,7 @@
         "cache_write": null,
         "output": "45",
         "threshold": 272000,
-        "scope": "session",
-        "source": "https://developers.openai.com/api/docs/models/gpt-5.5"
+        "source": "https://models.dev/api.json"
       },
       "source": "https://models.dev/api.json",
       "model_source": "https://developers.openai.com/api/docs/models/gpt-5.5"
@@ -69,8 +66,7 @@
         "cache_write": "0.5",
         "output": "1.8",
         "threshold": 272000,
-        "scope": "request",
-        "source": "https://developers.openai.com/api/docs/models/gpt-5.6-luna"
+        "source": "https://models.dev/api.json"
       },
       "source": "https://models.dev/api.json",
       "model_source": "https://developers.openai.com/api/docs/models/gpt-5.6-luna"
@@ -86,8 +82,7 @@
         "cache_write": "10",
         "output": "30",
         "threshold": 272000,
-        "scope": "request",
-        "source": "https://developers.openai.com/api/docs/models/gpt-5.6-sol"
+        "source": "https://models.dev/api.json"
       },
       "source": "https://models.dev/api.json",
       "model_source": "https://developers.openai.com/api/docs/models/gpt-5.6-sol"
@@ -103,8 +98,7 @@
         "cache_write": "5",
         "output": "18",
         "threshold": 272000,
-        "scope": "request",
-        "source": "https://developers.openai.com/api/docs/models/gpt-5.6-terra"
+        "source": "https://models.dev/api.json"
       },
       "source": "https://models.dev/api.json",
       "model_source": "https://developers.openai.com/api/docs/models/gpt-5.6-terra"
@@ -120,8 +114,7 @@
         "cache_write": "25",
         "output": "75",
         "threshold": 272000,
-        "scope": "request",
-        "source": "https://developers.openai.com/api/docs/models/gpt-6-astra"
+        "source": "https://models.dev/api.json"
       },
       "source": "https://models.dev/api.json",
       "model_source": "https://developers.openai.com/api/docs/models/gpt-6-astra"
@@ -137,8 +130,7 @@
         "cache_write": "0.25",
         "output": "0.75",
         "threshold": 272000,
-        "scope": "request",
-        "source": "https://developers.openai.com/api/docs/models/gpt-6-luna"
+        "source": "https://models.dev/api.json"
       },
       "source": "https://models.dev/api.json",
       "model_source": "https://developers.openai.com/api/docs/models/gpt-6-luna"
@@ -154,8 +146,7 @@
         "cache_write": "5",
         "output": "15",
         "threshold": 272000,
-        "scope": "request",
-        "source": "https://developers.openai.com/api/docs/models/gpt-6-sol"
+        "source": "https://models.dev/api.json"
       },
       "source": "https://models.dev/api.json",
       "model_source": "https://developers.openai.com/api/docs/models/gpt-6-sol"

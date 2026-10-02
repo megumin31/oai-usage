@@ -12,8 +12,10 @@ from pathlib import Path
 from typing import Optional
 
 ROOT = Path(__file__).resolve().parents[1]
-sys.path.insert(0, str(ROOT))
-import oai_price_catalog as catalog
+if __package__:
+    from . import price_support as catalog
+else:
+    import price_support as catalog
 
 CATALOG = ROOT / "prices.json"
 MODELS_URL = catalog.MODEL_LIST_URL + ".md"
@@ -105,7 +107,7 @@ def model_price(model: str, row: dict) -> dict:
         threshold = metadata["size"]
         if type(threshold) is not int or not 0 < threshold <= 10_000_000:
             raise ValueError("Invalid context-tier threshold")
-        long = {**rates(tier), "threshold": threshold, "scope": "request", "source": PRICES_URL}
+        long = {**rates(tier), "threshold": threshold, "source": PRICES_URL}
         if (base["cache_write"] is None) != (long["cache_write"] is None):
             raise ValueError("Inconsistent cache-write tier prices")
     return {**base, "long_context": long, "source": PRICES_URL, "model_source": MODEL_URL.format(model)}
@@ -144,7 +146,7 @@ def updated_catalog(old: dict, observed: dict[str, dict], today: str) -> dict:
     changed = models != previous
     if not changed and (age < 30 or not completely_checked):
         return old
-    return {"schema_version": 2, "basis": "standard_api_equivalent", "provider": "openai",
+    return {"basis": "standard_api_equivalent", "provider": "openai",
             "verified_at": today if completely_checked else old["verified_at"], "source": PRICES_URL,
             "model_source": catalog.MODEL_LIST_URL, "models": dict(sorted(models.items()))}
 

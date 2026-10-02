@@ -64,9 +64,20 @@ class PublishPrices(unittest.TestCase):
             publish.publish(self.candidate)
         self.assertEqual(gh.call_count, 1)
 
+    def test_untrusted_long_context_source_stops_before_publication(self):
+        self.new['models']['gpt-6-sol']['long_context']['source'] = \
+            'https://developers.openai.com/api/docs/models/gpt-6-sol'
+        self.candidate.write_text(json.dumps(self.new))
+        with patch.object(publish, 'gh') as gh, self.assertRaisesRegex(ValueError, 'rule source'):
+            publish.publish(self.candidate)
+        gh.assert_not_called()
+
     def test_symlinked_candidate_is_rejected(self):
         self.candidate.unlink()
-        self.candidate.symlink_to(self.baseline)
+        try:
+            self.candidate.symlink_to(self.baseline)
+        except OSError as exc:
+            self.skipTest(f'Symlink creation is unavailable: {exc}')
         with patch.object(publish, 'gh') as gh, self.assertRaises(ValueError):
             publish.publish(self.candidate)
         gh.assert_not_called()

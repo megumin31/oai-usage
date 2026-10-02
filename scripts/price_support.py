@@ -1,4 +1,4 @@
-"""Bounded live price downloads and strict catalog validation."""
+"""Bounded upstream downloads and catalog checks for price maintenance."""
 from __future__ import annotations
 
 import json
@@ -8,7 +8,7 @@ import subprocess
 import sys
 import tempfile
 import urllib.request
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from decimal import Decimal
 from http.client import HTTPException
@@ -16,11 +16,9 @@ from pathlib import Path
 from typing import Any, Optional
 
 UTC = timezone.utc
-PRICE_URL = "https://raw.githubusercontent.com/megumin31/oai-usage/main/prices.json"
 MODELS_DEV_URL = "https://models.dev/api.json"
 MODEL_LIST_URL = "https://developers.openai.com/api/docs/models/all"
 MAX_BYTES = 1_000_000
-STALE_DAYS = 45
 RATE = re.compile(r"[0-9]{1,10}(?:\.[0-9]{1,12})?\Z")
 
 
@@ -31,7 +29,6 @@ class Price:
     output: Decimal
     write: Optional[Decimal] = None
     long_threshold: Optional[int] = None
-    long_scope: str = "request"
     source: str = "custom"
     long_input: Optional[Decimal] = None
     long_cached: Optional[Decimal] = None
@@ -46,10 +43,6 @@ class PriceCatalog:
     prices: dict
     verified_at: str
     origin: str
-    fetched_at: Optional[str] = None
-    warnings: tuple = ()
-    source: Optional[str] = None
-    model_source: Optional[str] = None
 
 
 class DownloadError(ValueError):
@@ -62,13 +55,13 @@ class NoRedirect(urllib.request.HTTPRedirectHandler):
 
 
 def validate_download_url(url: str) -> None:
-    if url not in (PRICE_URL, MODELS_DEV_URL, MODEL_LIST_URL + ".md"):
+    if url not in (MODELS_DEV_URL, MODEL_LIST_URL + ".md"):
         raise DownloadError("Price download URL is not allowed")
 
 
 def download_budget(url: str) -> int:
     validate_download_url(url)
-    return 8_000_000 if url == MODELS_DEV_URL else MAX_BYTES if url == PRICE_URL else 2_000_000
+    return 8_000_000 if url == MODELS_DEV_URL else 2_000_000
 
 
 def _download(url: str, limit: int, socket_timeout: float) -> bytes:
@@ -93,24 +86,13 @@ def _download(url: str, limit: int, socket_timeout: float) -> bytes:
         return bytes(data)
 
 
-# Filled from this module's download implementation by scripts/bundle_prices.py.
-STDIN_DOWNLOAD_WORKER = None
-
-
-def fetch_https(url: str, limit: int = MAX_BYTES, total_timeout: float = 6,
-                socket_timeout: float = 3) -> bytes:
-    validate_download_url(url)
-    if not 0 < limit <= download_budget(url) or not 0 < total_timeout <= 60 or not 0 < socket_timeout <= total_timeout:
+def fetch_https(url: str, limit: int = MAX_BYTES, total_timeout: float = 20,
+                socket_timeout: float = 5) -> bytes:
+    """Download from an allowed upstream in a worker with a total deadline."""
+    if (type(limit) is not int or not 0 < limit <= download_budget(url) or
+            not 0 < total_timeout <= 20 or not 0 < socket_timeout <= min(5, total_timeout)):
         raise ValueError("Invalid price download limits")
-    # A separate, fixed local worker lets the parent terminate DNS, TLS, and slow
-    # reads together. Socket timeouts alone cannot bound the whole operation.
-    arguments = ["--download", url, str(limit), str(socket_timeout)]
-    if __file__ == "<stdin>":
-        if STDIN_DOWNLOAD_WORKER is None:
-            raise DownloadError("Streaming requires the standalone oai-usage script")
-        command = [sys.executable, "-c", STDIN_DOWNLOAD_WORKER, *arguments]
-    else:
-        command = [sys.executable, str(Path(__file__).resolve()), *arguments]
+    command = [sys.executable, str(Path(__file__).resolve()), "--download", url, str(limit), str(socket_timeout)]
     try:
         result = subprocess.run(command, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=total_timeout)
     except subprocess.TimeoutExpired:
@@ -186,9 +168,9 @@ def exact_keys(value: Any, expected: set) -> None:
 
 
 def parse_price_catalog(raw: Any, origin: str, today: Optional[date] = None) -> PriceCatalog:
-    exact_keys(raw, {"schema_version", "basis", "verified_at", "source", "models", "provider", "model_source"})
-    if type(raw["schema_version"]) is not int or raw["schema_version"] != 2 or raw["basis"] != "standard_api_equivalent":
-        raise ValueError("Invalid price catalog schema or basis")
+    exact_keys(raw, {"basis", "verified_at", "source", "models", "provider", "model_source"})
+    if raw["basis"] != "standard_api_equivalent":
+        raise ValueError("Invalid price catalog basis")
     if raw["provider"] != "openai" or raw["model_source"] != MODEL_LIST_URL:
         raise ValueError("Invalid price catalog model provider")
     if raw["source"] != MODELS_DEV_URL:
@@ -230,25 +212,23 @@ def parse_price_catalog(raw: Any, origin: str, today: Optional[date] = None) -> 
         long = row["long_context"]
         threshold = None
         if long is not None:
-            exact_keys(long, {"threshold", "scope", "input", "cached_input", "cache_write", "output", "source"})
+            exact_keys(long, {"threshold", "input", "cached_input", "cache_write", "output", "source"})
             threshold = long["threshold"]
-            # Accept the old schema-2 session field for published catalogs;
-            # estimates always select the context tier per request.
-            if type(threshold) is not int or not 0 < threshold <= 10_000_000 or long["scope"] not in ("request", "session"):
+            if type(threshold) is not int or not 0 < threshold <= 10_000_000:
                 raise ValueError("Invalid long-context rule")
-            if long["source"] not in (MODELS_DEV_URL, expected_source):
+            if long["source"] != MODELS_DEV_URL:
                 raise ValueError("Invalid long-context rule source")
         write = amount(row["cache_write"], True)
         long_write = amount(long["cache_write"], True) if long else None
         if long and (write is None) != (long_write is None):
             raise ValueError("Inconsistent cache-write rates")
         prices[model] = Price(amount(row["input"]), amount(row["cached_input"], True), amount(row["output"]),
-                              write, threshold, "request", row["source"],
+                              write, threshold, row["source"],
                               amount(long["input"]) if long else None,
                               amount(long["cached_input"], True) if long else None,
                               long_write, amount(long["output"]) if long else None,
                               row["model_source"], long["source"] if long else None)
-    return PriceCatalog(prices, verified_at, origin, source=raw["source"], model_source=raw["model_source"])
+    return PriceCatalog(prices, verified_at, origin)
 
 
 def read_limited(path: Path, limit: int = MAX_BYTES) -> bytes:
@@ -273,31 +253,12 @@ def atomic_write(path: Path, data: bytes) -> None:
             os.unlink(temporary)
 
 
-def catalog_info(catalog: PriceCatalog) -> dict:
-    stale = (datetime.now(UTC).date() - date.fromisoformat(catalog.verified_at)).days > STALE_DAYS
-    warnings = list(catalog.warnings)
-    if stale:
-        warnings.append(f"Price sources were last checked more than {STALE_DAYS} days ago.")
-    return {"verified_at": catalog.verified_at, "catalog_source": catalog.origin,
-            "fetched_at": catalog.fetched_at, "stale": stale, "warnings": warnings,
-            "price_source": catalog.source, "model_source": catalog.model_source}
-
-
-def load_price_catalog() -> PriceCatalog:
-    try:
-        data = fetch_https(PRICE_URL)
-        catalog = parse_price_catalog(strict_json(data), "github")
-    except (OSError, ValueError, HTTPException, RecursionError) as exc:
-        raise ValueError("Unable to load prices from GitHub; check your network and retry.") from exc
-    return replace(catalog, fetched_at=datetime.now(UTC).isoformat())
-
-
 def download_main() -> None:
     if len(sys.argv) != 5 or sys.argv[1] != "--download":
-        raise SystemExit("This module is loaded by oai-usage; it is not a standalone command")
+        raise SystemExit("This module is a price-maintenance download worker")
     try:
         download_limit, read_timeout = int(sys.argv[3]), float(sys.argv[4])
-        if not 0 < download_limit <= download_budget(sys.argv[2]) or not 0 < read_timeout <= 60:
+        if not 0 < download_limit <= download_budget(sys.argv[2]) or not 0 < read_timeout <= 5:
             raise ValueError("Invalid download limits")
         sys.stdout.buffer.write(_download(sys.argv[2], download_limit, read_timeout))
     except (OSError, ValueError, HTTPException):

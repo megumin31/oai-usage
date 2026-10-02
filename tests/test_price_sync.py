@@ -1,6 +1,8 @@
 import copy
 import io
 import json
+import subprocess
+import sys
 import tempfile
 import unittest
 from contextlib import redirect_stderr, redirect_stdout
@@ -44,11 +46,10 @@ class PriceSync(unittest.TestCase):
         self.assertTrue(old.prices.keys() <= new.prices.keys())
         for model, price in old.prices.items():
             for field in ('input', 'cached', 'write', 'output', 'long_input', 'long_cached',
-                          'long_write', 'long_output', 'long_threshold', 'long_scope'):
+                          'long_write', 'long_output', 'long_threshold'):
                 self.assertEqual(getattr(price, field), getattr(new.prices[model], field), (model, field))
             self.assertEqual(new.prices[model].source, sync.PRICES_URL)
             self.assertEqual(new.prices[model].model_source, sync.MODEL_URL.format(model))
-        self.assertEqual(raw['schema_version'], 2)
         self.assertEqual(raw['provider'], 'openai')
         sync.validate_transition(self.baseline(), raw, set(raw['models']))
 
@@ -110,7 +111,6 @@ class PriceSync(unittest.TestCase):
             discovered = sync.collect(listing(model), encoded({model: value}))
             imported = discovered[model]
             self.assertEqual(imported['cached_input'], '0.1')
-            self.assertEqual(imported['long_context']['scope'], 'request')
             self.assertEqual(imported['long_context']['source'], sync.PRICES_URL)
             self.assertEqual(imported['long_context']['threshold'], threshold)
             candidate = sync.updated_catalog(self.baseline(), discovered, '2026-09-30')
@@ -162,7 +162,7 @@ class PriceSync(unittest.TestCase):
         value['cost']['context_over_200k'] = {'input': 999}
         result = sync.collect(listing('gpt-7-sol'), encoded({'gpt-7-sol': value}))
         long = result['gpt-7-sol']['long_context']
-        self.assertEqual((long['threshold'], long['scope'], long['output']), (272000, 'request', '15'))
+        self.assertEqual((long['threshold'], long['output']), (272000, '15'))
         value['cost']['tiers'][0]['tier']['size'] = 200000
         result = sync.collect(listing('gpt-7-sol'), encoded({'gpt-7-sol': value}))
         self.assertEqual(result['gpt-7-sol']['long_context']['threshold'], 200000)
@@ -205,15 +205,20 @@ class PriceSync(unittest.TestCase):
         self.assertEqual(new['verified_at'], old['verified_at'])
         sync.validate_transition(old, new, set(observed))
 
-    def test_old_catalog_formats_are_rejected_without_migration(self):
+    def test_catalog_structure_and_model_identity_remain_strict(self):
         current = self.current()
-        old = copy.deepcopy(current)
-        old['schema_version'] = 1
-        for baseline, candidate in ((old, current), (current, old), (old, old)):
-            with self.assertRaisesRegex(ValueError, 'schema'):
-                sync.validate_transition(baseline, candidate)
-        with self.assertRaisesRegex(ValueError, 'schema'):
-            sync.updated_catalog(old, current['models'], '2026-09-26')
+        for mutate in (lambda value: value.update(extra='unexpected'),
+                       lambda value: value['models']['gpt-6-sol'].update(extra='unexpected'),
+                       lambda value: value['models']['gpt-6-sol']['long_context'].update(extra='unexpected'),
+                       lambda value: value['models']['gpt-6-sol'].update(model_source=sync.MODEL_URL.format('gpt-7-sol'))):
+            candidate = copy.deepcopy(current)
+            mutate(candidate)
+            with self.assertRaises(ValueError):
+                sync.validate_transition(current, candidate)
+        candidate = copy.deepcopy(current)
+        candidate['models']['gpt-6-sol']['long_context']['source'] = sync.MODEL_URL.format('gpt-6-sol')
+        with self.assertRaisesRegex(ValueError, 'rule source'):
+            sync.validate_transition(current, candidate)
 
     def test_candidate_cannot_forge_official_source_or_bypass_rule_review(self):
         old = self.current()
@@ -235,7 +240,7 @@ class PriceSync(unittest.TestCase):
         self.assertEqual(new['verified_at'], '2026-10-26')
         self.assertEqual(new['models'], old['models'])
 
-    def test_anomaly_gate_rejects_zero_extreme_changed_scope_and_lost_models(self):
+    def test_anomaly_gate_rejects_zero_extreme_changed_threshold_and_lost_models(self):
         old = self.current()
         for value in ('0', '100', '0.01'):
             new = copy.deepcopy(old)
@@ -307,6 +312,70 @@ class PriceSync(unittest.TestCase):
                 self.assertEqual(sync.main(), 0)
             self.assertIn('gpt-7-sol', output.getvalue())
             self.assertIn('date will not advance', output.getvalue())
+
+    def test_producer_support_is_local_and_only_allows_upstream_downloads(self):
+        worker = sync.ROOT / 'scripts' / 'price_support.py'
+        self.assertEqual(Path(sync.catalog.__file__).resolve(), worker)
+        self.assertEqual(sync.catalog.download_budget(sync.MODELS_URL), 2_000_000)
+        self.assertEqual(sync.catalog.download_budget(sync.PRICES_URL), 8_000_000)
+        for url in ('https://raw.githubusercontent.com/megumin31/oai-usage/main/prices.json',
+                    sync.PRICES_URL + '?extra=1', sync.MODELS_URL + '/extra', 'http://models.dev/api.json'):
+            with self.subTest(url=url), self.assertRaises(sync.catalog.DownloadError), \
+                 patch.object(sync.catalog.subprocess, 'run') as run:
+                sync.fetch(url)
+            run.assert_not_called()
+        result = subprocess.CompletedProcess([], 0, b'upstream', b'')
+        with patch.object(sync.catalog.subprocess, 'run', return_value=result) as run:
+            self.assertEqual(sync.fetch(sync.PRICES_URL), b'upstream')
+        self.assertEqual(run.call_args.args[0], [sys.executable, str(worker), '--download',
+                                               sync.PRICES_URL, '8000000', '5'])
+        self.assertEqual(run.call_args.kwargs['timeout'], 20)
+
+    def test_producer_worker_rejects_excessive_budgets_and_maps_failures(self):
+        for arguments in ({'limit': 8_000_001}, {'total_timeout': 21}, {'socket_timeout': 6},
+                          {'total_timeout': 2, 'socket_timeout': 3}):
+            with self.subTest(arguments=arguments), self.assertRaises(ValueError), \
+                 patch.object(sync.catalog.subprocess, 'run') as run:
+                sync.catalog.fetch_https(sync.PRICES_URL, **arguments)
+            run.assert_not_called()
+        for failure in (subprocess.TimeoutExpired([], 20), OSError('worker cannot start')):
+            with self.subTest(failure=failure), patch.object(sync.catalog.subprocess, 'run', side_effect=failure), \
+                 self.assertRaises(sync.catalog.DownloadError):
+                sync.fetch(sync.PRICES_URL)
+
+    def test_upstream_transfer_rejects_redirects_and_invalid_responses(self):
+        with self.assertRaises(sync.catalog.DownloadError):
+            sync.catalog.NoRedirect().redirect_request(None, None, 302, '', {}, sync.PRICES_URL)
+
+        class Response(io.BytesIO):
+            status = 200
+
+            def __init__(self, data, headers, url):
+                super().__init__(data)
+                self.headers, self.url = headers, url
+
+            def geturl(self):
+                return self.url
+
+        cases = ((b'abc', {'Content-Encoding': 'gzip'}, sync.PRICES_URL),
+                 (b'abc', {'Content-Length': 'invalid'}, sync.PRICES_URL),
+                 (b'abc', {'Content-Length': '11'}, sync.PRICES_URL),
+                 (b'abc', {'Content-Length': '4'}, sync.PRICES_URL),
+                 (b'x' * 11, {}, sync.PRICES_URL),
+                 (b'abc', {}, sync.PRICES_URL + '?redirect=1'))
+        for data, headers, url in cases:
+            with self.subTest(headers=headers, url=url), \
+                 patch.object(sync.catalog.urllib.request, 'build_opener') as opener:
+                opener.return_value.open.return_value = Response(data, headers, url)
+                with self.assertRaises(sync.catalog.DownloadError):
+                    sync.catalog._download(sync.PRICES_URL, 10, 5)
+
+    def test_update_script_starts_without_cli_or_repository_imports(self):
+        with tempfile.TemporaryDirectory() as directory:
+            result = subprocess.run([sys.executable, str(sync.ROOT / 'scripts' / 'update_prices.py'), '--help'],
+                                    cwd=directory, stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=10)
+        self.assertEqual(result.returncode, 0, result.stderr.decode())
+        self.assertIn(b'--dry-run', result.stdout)
 
 
 if __name__ == '__main__':
