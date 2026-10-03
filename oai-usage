@@ -1607,20 +1607,35 @@ def render(data: dict, args: argparse.Namespace, calendar: Calendar, columns: in
                      reverse=by not in ("model", "session"))
         shown = entries[:args.top] if args.top else entries
         lines += ["", title, "─" * columns]
-        if columns >= 120:
+        wide = columns >= 120
+        if wide:
             rows = []
             for key, row in shown:
                 tokens = row["usage"]
+                total = (f"{tokens['total_tokens']:,}",) if by == "model" else ()
                 rows.append((key, f"{tokens['input_tokens']:,}", f"{tokens['cached_input_tokens']:,}",
-                             f"{tokens['output_tokens']:,}", f"{tokens['reasoning_output_tokens']:,}",
+                             f"{tokens['output_tokens']:,}", *total, f"{tokens['reasoning_output_tokens']:,}",
                              percentage(tokens['cached_input_tokens'], tokens['input_tokens']),
                              percentage(tokens['output_tokens'], tokens['total_tokens']), money(row)))
-            lines += table(["Name", "Input", "Cached", "Output", "Reasoning", "Cached/In", "Out/Total", "API Cost"], rows, columns)
+            headers = ["Name", "Input", "Cached", "Output"] + (["Total"] if by == "model" else [])
+            table_lines = table(headers + ["Reasoning", "Cached/In", "Out/Total", "API Cost"], rows, columns)
+            # Large model counters can overflow even a wide screen; keep their totals and costs visible.
+            wide = by != "model" or all(width(line) <= columns for line in table_lines)
+        if wide:
+            lines += table_lines
         else:
             for key, row in shown:
                 tokens = row["usage"]
                 lines.append(f"  {safe_text(key)}  ·  {money(row)}")
-                lines.append(f"  In {tokens['input_tokens']:,} · Cached {tokens['cached_input_tokens']:,} · Out {tokens['output_tokens']:,}")
+                token_line = f"  In {tokens['input_tokens']:,} · Cached {tokens['cached_input_tokens']:,} · Out {tokens['output_tokens']:,}"
+                if by == "model":
+                    total = f" · Total {tokens['total_tokens']:,}"
+                    if width(token_line + total) <= columns:
+                        token_line += total
+                    else:
+                        lines.append(token_line)
+                        token_line = f"  Total {tokens['total_tokens']:,}"
+                lines.append(token_line)
                 if not compact:
                     lines.append(f"  Reasoning {tokens['reasoning_output_tokens']:,} · Cached/In {percentage(tokens['cached_input_tokens'], tokens['input_tokens'])} · Out/Total {percentage(tokens['output_tokens'], tokens['total_tokens'])}")
             if not shown:
