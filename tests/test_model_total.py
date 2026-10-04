@@ -29,28 +29,34 @@ class ModelTotal(unittest.TestCase):
     def render(self, data, columns=120, *flags):
         return M['render'](data, M['parse_args'](list(flags)), M['Calendar'].make('UTC'), columns)
 
-    def test_wide_each_model_has_total_after_output_without_double_counting(self):
+    def content(self, text):
+        return '\n'.join('  ' + line[2:-2].rstrip() if line.startswith('│ ') and line.endswith(' │')
+                         else line for line in text.splitlines())
+
+    def test_wide_reasoning_precedes_total_without_double_counting(self):
         text = self.render(self.data())
-        header = next(line for line in text.splitlines() if line.startswith('  Name'))
-        self.assertEqual(header.split(), ['Name', 'Input', 'Cached', 'Output', 'Total',
-                                          'Reasoning', 'Cached/In', 'Out/Total', 'API', 'Cost'])
+        header = next(line for line in self.content(text).splitlines() if line.startswith('  Name'))
+        self.assertEqual(header.split(), ['Name', 'Input', 'Cached', 'Output', 'Reasoning',
+                                          'Total', 'Cached/In', 'Out/Total', 'API', 'Cost'])
         for model, expected in (
-            ('alpha', ['alpha', '100', '90', '100', '200', '20', '90.0%', '50.0%', '$1.2500']),
-            ('beta', ['beta', '900', '300', '100', '1,000', '30', '33.3%', '10.0%', '$2.5000']),
+            ('alpha', ['alpha', '100', '90', '100', '20', '200', '90.0%', '50.0%', '$1.2500']),
+            ('beta', ['beta', '900', '300', '100', '30', '1,000', '33.3%', '10.0%', '$2.5000']),
         ):
             with self.subTest(model=model):
-                self.assertEqual(next(line for line in text.splitlines()
+                self.assertEqual(next(line for line in self.content(text).splitlines()
                                       if line.startswith('  ' + model)).split(), expected)
-        self.assertFalse(any(line.startswith('  Total') for line in text.splitlines()))
-        self.assertNotIn('Total includes all models', text)
+        total = next(line.split() for line in self.content(text).splitlines() if line.startswith('  Total '))
+        self.assertEqual(total, ['Total', '1,000', '390', '200', '50', '1,200', '39.0%', '16.7%', '$3.7500'])
+        self.assertNotIn('Total', self.data()['summary']['by_model'])
 
     def test_top_keeps_only_selected_model_with_its_own_total(self):
         text = self.render(self.data(), 120, '--top', '1')
-        self.assertNotIn('  alpha', text)
-        beta = next(line for line in text.splitlines() if line.startswith('  beta'))
-        self.assertEqual(beta.split()[4], '1,000')
-        self.assertIn('Showing 1/2 entries', text)
-        self.assertFalse(any(line.startswith('  Total') for line in text.splitlines()))
+        self.assertFalse(any(line.startswith('  alpha') for line in self.content(text).splitlines()))
+        beta = next(line for line in self.content(text).splitlines() if line.startswith('  beta'))
+        self.assertEqual(beta.split()[5], '1,000')
+        self.assertIn('Showing 1/2 models', text)
+        total = next(line.split() for line in self.content(text).splitlines() if line.startswith('  Total '))
+        self.assertEqual(total[1:6], ['1,000', '390', '200', '50', '1,200'])
 
     def test_narrow_report_and_watch_show_each_model_total(self):
         for command in ('report', 'watch'):
@@ -59,11 +65,11 @@ class ModelTotal(unittest.TestCase):
                     text = self.render(self.data(), columns, command)
                     self.assertIn('Total 200', text)
                     self.assertIn('Total 1,000', text)
-                    self.assertNotIn('Total 1,200', text)
+                    self.assertIn('Total 1,200', text.split('│ By model', 1)[1])
                     self.assertTrue(all(M['width'](line) <= columns for line in text.splitlines()))
                     if columns >= 80:
-                        self.assertIn('In 100 · Cached 90 · Out 100 · Total 200', text)
-                        self.assertIn('In 900 · Cached 300 · Out 100 · Total 1,000', text)
+                        self.assertIn('Input 100 · Cached 90 · Output 100 · Reasoning 20 · Total 200', ' '.join(self.content(text).split()))
+                        self.assertIn('Input 900 · Cached 300 · Output 100 · Reasoning 30 · Total 1,000', ' '.join(self.content(text).split()))
 
     def test_large_counters_preserve_total_and_cost_on_80_to_140_columns(self):
         data = self.data()
@@ -77,32 +83,38 @@ class ModelTotal(unittest.TestCase):
                 self.assertIn('$1,342.3968', text)
                 self.assertTrue(all(M['width'](line) <= columns for line in text.splitlines()))
 
-    def test_empty_period_keeps_no_records_and_no_aggregate_row(self):
+    def test_empty_period_keeps_zero_total_without_a_synthetic_json_model(self):
+        data = self.data(empty=True)
         for columns in (80, 120):
-            text = self.render(self.data(empty=True), columns)
-            self.assertIn('No records', text)
-            self.assertIn('No usage in this report period', text)
-            self.assertFalse(any(line.startswith('  Total') for line in text.splitlines()))
-            self.assertNotIn('Total 0', text)
+            text = self.render(data, columns)
+            self.assertIn('No local usage records in this report period', text)
+            if columns >= 120:
+                total = next(line.split() for line in self.content(text).splitlines() if line.startswith('  Total '))
+                self.assertEqual(total, ['Total', '0', '0', '0', '0', '0', '-', '-', '$0.0000'])
+            else:
+                self.assertIn('Total · API cost $0.0000', text)
+                self.assertIn('Total 0', text.split('│ By model', 1)[1])
+        self.assertEqual(data['summary']['by_model'], {})
 
-    def test_other_dimensions_are_unchanged_and_all_only_adds_model_column(self):
+    def test_other_dimensions_retain_columns_and_all_only_adds_model_column(self):
         for by in ('day', 'week', 'month', 'session'):
             text = self.render(self.data(), 120, '--by', by)
-            header = next((line for line in text.splitlines() if line.startswith('  Name')), '')
+            section = text.split('╭─ By ' + ('session' if by == 'session' else by), 1)[1]
+            header = next((line for line in self.content(section).splitlines() if line.startswith('  Name')), '')
             self.assertNotIn('Total', header.split())
         text = self.render(self.data(), 120, '--all')
-        headers = [line for line in text.splitlines() if line.startswith('  Name')]
+        headers = [line for line in self.content(text).splitlines() if line.startswith('  Name')]
         self.assertEqual(sum('Total' in line.split() for line in headers), 1)
-        self.assertFalse(any(line.startswith('  Total') for line in text.splitlines()))
+        self.assertEqual(sum(line.startswith('  Total ') for line in self.content(text).splitlines()), 1)
 
     def test_color_keeps_wide_column_alignment(self):
         text = self.render(self.data())
         colored = '\n'.join(M['style_line'](line) for line in text.splitlines())
         self.assertEqual(M['re'].sub(r'\x1b\[[0-9;]*m', '', colored), text)
-        header = next(line for line in text.splitlines() if line.startswith('  Name'))
+        header = next(line for line in self.content(text).splitlines() if line.startswith('  Name'))
         right_edge = header.index('Total') + len('Total')
         for model, count in (('alpha', '200'), ('beta', '1,000')):
-            line = next(line for line in text.splitlines() if line.startswith('  ' + model))
+            line = next(line for line in self.content(text).splitlines() if line.startswith('  ' + model))
             self.assertEqual(line[:right_edge].split()[-1], count)
             self.assertEqual(line[right_edge], ' ')
 
@@ -151,7 +163,7 @@ class ModelTotal(unittest.TestCase):
                     text = M['render'](data, args, M['Calendar'].make('UTC'), columns)
                     for model, total in expected.items():
                         if columns == 120:
-                            line = next(line for line in text.splitlines() if line.startswith('  ' + model))
-                            self.assertEqual(line.split()[4], str(total))
+                            line = next(line for line in self.content(text).splitlines() if line.startswith('  ' + model))
+                            self.assertEqual(line.split()[5], str(total))
                         else:
                             self.assertIn('Total ' + str(total), text)

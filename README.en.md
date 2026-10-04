@@ -14,7 +14,9 @@ Download and run directly:
 curl -fsSL https://raw.githubusercontent.com/megumin31/oai-usage/main/oai-usage | python3 -
 ```
 
-The default report covers the last 30×24 hours, grouped by model. Prices require network access. Live quota requires native Codex installed locally and signed in with a ChatGPT account.
+The default report groups local logs within the current account quota cycle by model. When several valid windows exist, it selects the longest (for example, Secondary) and labels the actual start and window. If quota lookup is disabled or no current cycle can be validated, it explicitly falls back to the last 30×24 hours. Prices require network access. Live quota requires native Codex installed locally and signed in with a ChatGPT account.
+
+Tokens and API-equivalent costs cover only local Codex session logs. Account quota is account-wide and has different coverage: an empty local period does not mean the account was unused. Cloud-coordinated Work or dot tasks can run tools on this computer without adding their model usage to these logs; the quota percentage does not identify which tasks or devices caused usage.
 
 <details>
 <summary>Optional arguments</summary>
@@ -83,7 +85,7 @@ python .\oai-usage --days all
 
 For the Codex desktop app's default Windows-native agent environment, run this script with Windows Python in PowerShell. Without `CODEX_HOME`, the script reads `sessions` and `archived_sessions` under `%USERPROFILE%\.codex`. Changing only the app's integrated terminal shell does not change this path. The agent environment is a separate setting; see the [Codex Windows documentation](https://learn.chatgpt.com/docs/windows/windows-app#windows-subsystem-for-linux-wsl).
 
-If you changed the agent environment or `CODEX_HOME`, confirm that the script reads the actual log location; it does not automatically search other directories in WSL. Repeat `--root` to specify log directories explicitly (replacing the defaults), including both `sessions` and `archived_sessions`. `--root` only changes log scanning, not the Codex executable or login environment used for live quota queries. Reports cover the last 30 days by default; use `--days all` for older records.
+If you changed the agent environment or `CODEX_HOME`, confirm that the script reads the actual log location; it does not automatically search other directories in WSL. Repeat `--root` to specify log directories explicitly (replacing the defaults), including both `sessions` and `archived_sessions`. `--root` only changes log scanning, not the Codex executable or login environment used for live quota queries. Reports use the valid current quota cycle by default, with a 30-day fallback when unavailable; use `--days all` for older records.
 
 ## Common commands
 
@@ -111,6 +113,8 @@ Prices and source:
 python3 ./oai-usage prices
 ```
 
+The terminal shows two independent period blocks: This cycle (Selected) and Last 30 days (reference). Each keeps its name, dates, and source, then shows its own By model token and cost breakdown with a Total footer for all models in that period; overlapping periods are never added together. `--today`, `--days`, `--since`, and `--until` override Selected and its model breakdown, while the last 30 days remains a reference. Without a valid cycle, Selected falls back to the last 30 days. Identical Selected and reference ranges appear only once. `--top` limits displayed models separately in each period, while Total always covers every model; `--top 0` shows all. Token columns are ordered Input, Cached, Output, Reasoning, Total. Total remains Input + Output; Reasoning is already included in Output. Ratios use aggregate numerators and denominators, and sessions are counted uniquely. JSON retains every model without adding a synthetic Total model.
+
 Use `report --help`, `watch --help`, or `prices --help` for all options. Common filters include `--today`, `--days all`, `--since`, `--until`, `--root`, and `--by`; `--price` overrides unit prices.
 
 ## Quota, prices, and data
@@ -126,15 +130,23 @@ Use `report --help`, `watch --help`, or `prices --help` for all options. Common 
 
 `watch` refreshes every 2 seconds by default. Each quota query is followed by a 30-second wait; adjust these with `--refresh` and `--quota-interval`. `--count N` limits refreshes. Use `--codex-binary` if Codex cannot be found automatically.
 
+When the complete dashboard does not fit the terminal height, `watch` switches to full scrollback frames and explains the change. Scroll to read both periods, their model rows, and both Total footers. It stays in scrollback after a resize so earlier frames remain accessible; `--top 0` includes every model.
+
 Windows consoles automatically enable terminal controls and restore the original mode on exit. If this fails, colors are disabled and `watch` prints plain frames without clearing the screen or hiding the cursor.
 
 Prices come from third-party models.dev OpenAI data, maintained as the repository's [`prices.json`](./prices.json). The consumer downloads only the finished GitHub catalog and saves no price cache. Startup price failure exits the program. Watch refreshes prices hourly in the background and keeps the current run's valid catalog if a refresh fails.
 
 Costs use exact model IDs and select price tiers per request. They are **neither historical bills nor subscription bills**. Unknown models, insufficient request details, or missing cache prices mark the estimate as incomplete.
 
-The current cycle uses the quota interface's actual window, independently of report date filters. Estimated total and remaining amounts extrapolate from local costs and account usage. They are **not official quotas or subscription dollar balances**; unavailable projections are explained. `--no-project` hides cycle cards.
+Account quota and current cycle share one panel: account percentages come from quota snapshots, while local tokens and API-equivalent costs come from logs. A cycle starts at reset time minus window length, with both window and observation times validated; it is not a calendar month. The default report selects the longest valid window through the current report time; cycle cost projections stop at the quota snapshot time. These cutoffs are labeled separately. Explicit report date filters remain independent of cycle projections. Estimated total and remaining amounts extrapolate from local costs and account usage. They are **not official quotas or subscription dollar balances**; unavailable projections are explained. `--no-project` hides cycle estimates while keeping account quota visible.
 
-Logs are read from `sessions` and `archived_sessions` under `$CODEX_HOME` (or `~/.codex` when unset); `--root` replaces these directories. Original logs are read-only, with no log uploads or credential-content reads. `--json` emits complete data; watch emits one JSON line per frame. `--output` cannot overwrite the program or JSONL logs.
+Query cleanup has bounded pipe draining on all platforms. On POSIX, the owned process group is terminated, including descendants that inherit output pipes. Windows kills the direct child and closes the pipes within the cleanup deadline; descendant-tree termination has not been validated on native Windows.
+
+Accounting supports both legacy `token_count` snapshots and per-response `token_usage_record` receipts. Response IDs remove retransmissions; matching request vectors and cumulative coverage prevent counting both formats twice. Legacy-only history stays included, each native receipt retains its response time and model, and a native cumulative baseline is never charged as a new request. Forked parent receipts and compaction checkpoints are excluded. If the counter domains cannot be reconciled, the report names the uncertain legacy interval and retains observed response usage without inventing a residual charge.
+
+Price errors distinguish download failures from invalid catalog data, including background refresh warnings. `--today` can show an empty interval at exact local midnight, and watch continues into the new day.
+
+Logs are read from `sessions` and `archived_sessions` under `$CODEX_HOME` (or `~/.codex` when unset); `--root` replaces these directories. Original logs are read-only, with no log uploads or credential-content reads. `--json` emits complete data; watch emits one JSON line per frame. `period.selection` identifies `current_cycle`, `explicit`, or `fallback`. Current-cycle reports include `cycle_window` and `cycle_resets_at`; fallback reports include `fallback_reason`. Existing usage, cost, and grouping JSON fields are retained. The additive `period_summaries` field provides local totals, complete `by_model` / `by_model_detail` breakdowns, bounds, and sources for each period; the reference does not change the original `period` or `summary`. `--output` cannot overwrite the program or JSONL logs.
 
 Dates use the local time zone by default. UTC needs no extra data; other named time zones depend on the system time-zone database. Terminal dates show the actual offset at that point in time as `UTC±HH:MM`, or `UTC` for a zero offset.
 

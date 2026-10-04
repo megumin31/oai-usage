@@ -558,9 +558,10 @@ class Presentation(unittest.TestCase):
         self.assertIn('~$90.0000', text)
         self.assertIn('Ctrl+C to quit', text)
         self.assertIn('\033[1;36mOAI USAGE', text)
-        self.assertTrue(text.endswith('\033[?1049l\033[?25h'))
+        self.assertIn('watch uses scrollback', text)
+        self.assertNotIn('\033[?1049h', text)
         visible = M['re'].sub(r'\x1b\[[?0-9;]*[A-Za-z]', '', text)
-        self.assertLessEqual(len(visible.splitlines()), 24)
+        self.assertGreater(len(visible.splitlines()), 24)
         self.assertTrue(all(M['width'](line) <= 100 for line in visible.splitlines()))
 
     def test_watch_narrow_screen_fits_notice_and_footer(self):
@@ -576,7 +577,8 @@ class Presentation(unittest.TestCase):
                 self.assertEqual(M['main'](['watch', '--quota', 'logs', '--count', '1', '--no-color']), 0)
             visible = M['re'].sub(r'\x1b\[[?0-9;]*[A-Za-z]', '', output.getvalue())
             self.assertTrue(all(M['width'](line) <= columns for line in visible.splitlines()))
-            self.assertLessEqual(len(visible.splitlines()), 24)
+            self.assertGreater(len(visible.splitlines()), 24)
+            self.assertIn('scrollback', visible)
 
     def test_help_prices_errors_and_empty_reports_are_english(self):
         with tempfile.TemporaryDirectory() as root:
@@ -685,7 +687,7 @@ class Presentation(unittest.TestCase):
             self.assertEqual(data['summary']['cycle_estimates']['primary']['local']['usage']['total_tokens'], 100)
             text = M['render'](data, args, M['Calendar'].make('UTC'))
             self.assertIn('$0.001000', text)
-            self.assertIn('No usage in this report period', text)
+            self.assertIn('No local usage records in this report period', text)
 
 
 class TerminalCompatibility(unittest.TestCase):
@@ -720,7 +722,7 @@ class TerminalCompatibility(unittest.TestCase):
     def run_dashboard(self, *args):
         data = Presentation().data()
         with patch.dict(G, {'report': lambda *a, **kw: data}), \
-             patch.object(M['shutil'], 'get_terminal_size', return_value=os.terminal_size((100, 24))):
+             patch.object(M['shutil'], 'get_terminal_size', return_value=os.terminal_size((100, 120))):
             return M['main']([*args, '--quota', 'logs'])
 
     def test_windows_enables_vt_preserving_and_restoring_mode(self):

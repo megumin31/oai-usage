@@ -15,6 +15,7 @@ import os
 import platform
 import re
 import shutil
+import signal
 import sys
 import tempfile
 import time
@@ -135,37 +136,52 @@ async def stop_process(process) -> None:
 
 
 async def _stop_process(process) -> None:
-    """Terminate, reap, and drain pipes, including on timeout or cancellation."""
+    """Bound cleanup even when a descendant keeps an inherited pipe open."""
     if process.stdin:
         process.stdin.close()
 
+    def terminate(force=False):
+        try:
+            if os.name == "posix" and getattr(process, "_owned_group", False):
+                # start_process creates our own session, never the caller's group.
+                os.killpg(process.pid, signal.SIGKILL if force else signal.SIGTERM)
+            elif process.returncode is None:
+                process.kill() if force else process.terminate()
+        except ProcessLookupError:
+            pass
+
     async def discard(stream):
-        if stream:
-            while await stream.read(65536):
-                pass
+        while await stream.read(65536):
+            pass
 
     drains = [asyncio.create_task(discard(stream)) for stream in (process.stdout, process.stderr) if stream]
     try:
-        if process.returncode is None:
-            try:
-                process.terminate()
-            except ProcessLookupError:
-                pass
+        terminate()
         try:
-            await asyncio.wait_for(process.wait(), .5)
+            await asyncio.wait_for(process.wait(), .25)
         except TimeoutError:
-            try:
-                process.kill()
-            except ProcessLookupError:
-                pass
-            await process.wait()
+            pass
+        # The immediate child may have exited while its descendants still live.
+        terminate(force=True)
+        try:
+            async with asyncio.timeout(.25):
+                await process.wait()
+                await asyncio.gather(*drains)
+                if process.stdin:
+                    await process.stdin.wait_closed()
+        except (TimeoutError, BrokenPipeError, ConnectionResetError):
+            pass
     finally:
-        await asyncio.gather(*drains)
-        if process.stdin:
-            try:
-                await process.stdin.wait_closed()
-            except (BrokenPipeError, ConnectionResetError):
-                pass
+        for task in drains:
+            task.cancel()
+        await asyncio.gather(*drains, return_exceptions=True)
+        # asyncio.Process has no public close-pipes API. Closing its transport
+        # releases inherited pipe handles without waiting for a descendant EOF.
+        process._transport.close()
+        try:
+            await asyncio.wait_for(process.wait(), .25)
+        except TimeoutError:
+            pass
 
 
 async def start_process(*command, **kwargs):
@@ -173,7 +189,11 @@ async def start_process(*command, **kwargs):
     # delivery of the Process object. The caller owns it after this returns.
     async def spawn():
         try:
-            return await asyncio.create_subprocess_exec(*command, **kwargs), None
+            if os.name == "posix":
+                kwargs["start_new_session"] = True
+            process = await asyncio.create_subprocess_exec(*command, **kwargs)
+            process._owned_group = os.name == "posix"
+            return process, None
         except Exception as exc:
             # A result envelope lets the cancellation owner handle a late spawn
             # failure without asyncio logging an abandoned shield exception.
@@ -340,9 +360,12 @@ def catalog_info(catalog: PriceCatalog) -> dict:
 async def load_price_catalog_async() -> PriceCatalog:
     try:
         data = await fetch_https_async(PRICE_URL)
+    except (OSError, DownloadError, HTTPException) as exc:
+        raise ValueError("Unable to load prices from GitHub: download failed; check your network and retry.") from exc
+    try:
         catalog = parse_price_catalog(strict_json(data), "github")
-    except (OSError, ValueError, HTTPException, RecursionError) as exc:
-        raise ValueError("Unable to load prices from GitHub; check your network and retry.") from exc
+    except (ValueError, RecursionError) as exc:
+        raise ValueError("Unable to load prices from GitHub: invalid price data; the catalog format or values failed validation.") from exc
     return replace(catalog, fetched_at=datetime.now(UTC).isoformat())
 
 
@@ -464,6 +487,16 @@ class Snapshot:
     context_window: int = 0
 
 
+@dataclass(frozen=True)
+class ResponseUsage:
+    at: Optional[datetime]
+    model: str
+    response_id: str
+    thread_id: str
+    usage: Usage
+    cumulative: Optional[Usage]
+
+
 @dataclass
 class Rollout:
     path: Path
@@ -473,6 +506,7 @@ class Rollout:
     model: str = "unknown"
     metadata_seen: bool = False
     snapshots: list = field(default_factory=list)
+    responses: list = field(default_factory=list)
     limits: dict = field(default_factory=dict)
     issues: Counter = field(default_factory=Counter)
     offset: int = 0
@@ -508,6 +542,17 @@ class Rollout:
                 model = settings.get("model")
             if isinstance(model, str) and model:
                 self.model = model
+        elif kind == "token_usage_record":
+            usage = Usage.parse(payload.get("usage"))
+            response_id, thread_id = payload.get("response_id"), payload.get("thread_id")
+            if usage is None or not isinstance(response_id, str) or not response_id or not isinstance(thread_id, str) or not thread_id:
+                self.issues["invalid_usage_records"] += 1
+                return
+            if not self.metadata_seen and not self.responses:
+                # Native-only fragments still carry their logical owner identity.
+                self.session_id = thread_id
+            self.responses.append(ResponseUsage(at, self.model, response_id, thread_id, usage,
+                                                Usage.parse(payload.get("thread_token_usage"))))
         elif kind == "event_msg" and payload.get("type") == "token_count":
             inherited = bool(self.parent_id and self.created_at and at and at < self.created_at)
             if not inherited:
@@ -573,23 +618,22 @@ class Scanner:
                         self.bytes_read += len(line)
                         if not line:
                             break
-                        relevant = any(word in line for word in (b'"session_meta"', b'"turn_context"', b'"token_count"'))
-                        if not line.endswith(b"\n"):
-                            # Leave an incomplete trailing record for the next append.
-                            try:
-                                record = json.loads(line)
-                            except (ValueError, UnicodeDecodeError):
+                        relevant = any(word in line for word in (b'"session_meta"', b'"turn_context"', b'"token_count"', b'"token_usage_record"'))
+                        try:
+                            record = json.loads(line) if relevant or not line.endswith(b"\n") else None
+                        except (ValueError, UnicodeDecodeError, RecursionError):
+                            if not line.endswith(b"\n"):
+                                # An incomplete trailing write may become valid on append.
                                 rollout.issues["pending_partial_line"] = 1
                                 break
-                            rollout.issues.pop("pending_partial_line", None)
+                            rollout.issues["malformed_json_lines"] += 1
+                        else:
                             if relevant:
-                                rollout.ingest(record)
-                        elif relevant:
-                            try:
-                                rollout.ingest(json.loads(line))
-                            except (ValueError, UnicodeDecodeError, RecursionError):
-                                rollout.issues["malformed_json_lines"] += 1
-                            rollout.issues.pop("pending_partial_line", None)
+                                try:
+                                    rollout.ingest(record)
+                                except (ValueError, UnicodeDecodeError, RecursionError):
+                                    rollout.issues["malformed_json_lines"] += 1
+                        rollout.issues.pop("pending_partial_line", None)
                         rollout.offset = stream.tell()
                 rollout.signature = sig
                 if self._state(rollout) != before:
@@ -608,7 +652,7 @@ class Scanner:
         if rollout is None:
             return ()
         return (rollout.session_id, rollout.parent_id, rollout.created_at,
-                tuple(rollout.snapshots), tuple(sorted(rollout.issues.items())))
+                tuple(rollout.snapshots), tuple(rollout.responses), tuple(sorted(rollout.issues.items())))
 
 
 @dataclass(frozen=True)
@@ -688,6 +732,7 @@ def account(rollouts: list) -> tuple:
         previous_at = None
         own_seen = False
         pending_reset = False
+        ledger = []
         for _, _, snap, segment_start in snapshots:
             cur = snap.cumulative
             # A positive reset requires a new rollout's creation boundary after
@@ -713,6 +758,8 @@ def account(rollouts: list) -> tuple:
                 elif cur.total_tokens:
                     issues["unattributed_fork_baseline_tokens"] += cur.total_tokens
                     delta = Usage()
+            entry = [snap, previous if not reset else None, None, reset]
+            ledger.append(entry)
             previous = cur  # Zero is a real snapshot, including a counter reset.
             previous_at = snap.at
             if snap.inherited:
@@ -736,12 +783,196 @@ def account(rollouts: list) -> tuple:
                 # A cumulative delta can contain multiple requests. For <= threshold,
                 # none can individually exceed that threshold; larger deltas are unknown.
                 issues["events_without_request_detail"] += 1
-            session.events.append(Event(sid, snap.at, snap.model, delta, request_input,
-                                        pending_reset, request_detail_uncertain))
+            entry[2] = Event(sid, snap.at, snap.model, delta, request_input,
+                             pending_reset, request_detail_uncertain)
+            session.events.append(entry[2])
             pending_reset = False
+        reconcile_responses(session, files, ledger, issues)
         if session.events:
             sessions.append(session)
     return sessions, issues
+
+
+def usage_remainder(total: Usage, part: Usage) -> Optional[Usage]:
+    """Exact subtraction only; clamping would hide conflicting ledger evidence."""
+    return Usage.parse({key: getattr(total, key) - getattr(part, key) for key in FIELDS})
+
+
+def reconcile_responses(session: Session, files: list, ledger: list, issues: Counter) -> None:
+    """Union response receipts with legacy coverage, never sum the two ledgers.
+
+    Native cumulative counters are matching evidence, not billable increments:
+    their initial baseline and their counter domain may differ from token_count.
+    A response receipt replaces its covered part of a legacy event. Only an
+    exact cumulative anchor permits additional coverage/residual attribution.
+    """
+    unique = {}
+    for rollout in files:
+        for record in rollout.responses:
+            if record.thread_id != session.session_id or (
+                session.parent_id and session.created_at and record.at and record.at < session.created_at
+            ):
+                issues["inherited_usage_records_excluded"] += 1
+                continue
+            prior = unique.get(record.response_id)
+            if prior is not None:
+                issues["duplicate_usage_records_removed"] += 1
+                if prior.usage != record.usage:
+                    issues["conflicting_usage_records"] += 1
+                if prior.model == "unknown" and record.model != "unknown":
+                    unique[record.response_id] = replace(prior, model=record.model)
+                continue
+            unique[record.response_id] = record
+    records = sorted(unique.values(), key=lambda r: r.at or datetime.max.replace(tzinfo=UTC))
+    if not records:
+        return
+
+    # Every snapshot gets a reset segment, including zero/context corrections.
+    segments, segment = [], 0
+    exact, requests = defaultdict(list), defaultdict(list)
+    for index, (snap, _, event, reset) in enumerate(ledger):
+        segment += bool(reset)
+        segments.append(segment)
+        if not snap.inherited:
+            exact[(snap.cumulative, snap.last)].append(index)
+            requests[snap.last].append(index)
+    coverage, matched, domains = defaultdict(list), set(), {}
+    assignments = {}
+    dated = [(entry[0].at, i) for i, entry in enumerate(ledger) if entry[0].at]
+    dates = [item[0] for item in dated]
+    def distance(index, record):
+        at = ledger[index][0].at
+        return abs((at - record.at).total_seconds()) if at and record.at else float("inf")
+
+    def follows(index, record):
+        at = ledger[index][0].at
+        # Codex persists a response receipt before publishing its token_count.
+        # Equal timestamps allow replay/reordering; an older request with equal
+        # counters is not a receipt for a later response after an upgrade/reset.
+        return at is None or record.at is None or at >= record.at
+
+    for number, record in enumerate(records):
+        candidates = [i for i in exact.get((record.cumulative, record.usage), ())
+                      if i not in matched and follows(i, record)]
+        if not candidates:
+            # Different cumulative domains (e.g. compaction): only adjacent
+            # observations with the same last-request vector establish a pair.
+            position = bisect_left(dates, record.at) if record.at else len(dates)
+            next_at = dates[position] if position < len(dates) else None
+            candidates = [i for i in requests.get(record.usage, ())
+                          if i not in matched and ledger[i][0].at == next_at and follows(i, record)]
+        if candidates:
+            index = min(candidates, key=lambda i: (ledger[i][2] is None, distance(i, record), i))
+            matched.add(index)
+            assignments[number] = index
+            coverage[index].append(record)
+            if record.cumulative is not None:
+                domains[index] = tuple(getattr(ledger[index][0].cumulative, key) -
+                                       getattr(record.cumulative, key) for key in FIELDS)
+
+    # A domain can change without decreasing the legacy counter. Scope trust to
+    # neighboring anchors rather than the whole monotonically increasing run.
+    anchors = sorted(domains)
+    trusted = set()
+    for index in range(len(ledger)):
+        position = bisect_left(anchors, index)
+        after = anchors[position] if position < len(anchors) else None
+        before = anchors[position - 1] if position else None
+        if after is None or segments[after] != segments[index]:
+            continue
+        if before is not None and segments[before] == segments[index]:
+            compatible = domains[before] == domains[after]
+        else:
+            compatible = domains[after] == (0,) * len(FIELDS)
+        if compatible:
+            trusted.add(index)
+
+    # A later cumulative snapshot can already contain a receipt whose paired
+    # token_count was never written. Require a shared, proven counter domain.
+    for number, record in enumerate(records):
+        if number in assignments or record.cumulative is None:
+            continue
+        before_request = usage_remainder(record.cumulative, record.usage)
+        if before_request is None:
+            continue
+        for index, (snap, previous, event, _) in enumerate(ledger):
+            if not event or index not in trusted or not follows(index, record):
+                continue
+            baseline = previous or Usage()
+            position = bisect_left(anchors, index)
+            anchor = anchors[position]
+            shifted = Usage.parse({key: getattr(record.cumulative, key) + domains[anchor][n]
+                                   for n, key in enumerate(FIELDS)})
+            shifted_before = usage_remainder(shifted, record.usage) if shifted else None
+            if (shifted_before is not None and usage_remainder(shifted_before, baseline) is not None and
+                    usage_remainder(snap.cumulative, shifted) is not None):
+                coverage[index].append(record)
+                assignments[number] = index
+                break
+
+    # A missing token_count followed by a legacy-only request can itself
+    # establish coverage: both its exact delta and cumulative endpoint must
+    # equal the observed receipts plus that distinct last request.
+    for index, (snap, _, event, _) in enumerate(ledger):
+        if not event or not snap.last or not snap.at or coverage.get(index):
+            continue
+        previous_at = ledger[index - 1][0].at if index else None
+        pending = [(n, r) for n, r in enumerate(records) if n not in assignments and r.at and
+                   (previous_at is None or r.at > previous_at) and r.at <= snap.at]
+        if not pending or pending[-1][1].cumulative is None:
+            continue
+        amount = sum((r.usage for _, r in pending), Usage())
+        if (amount + snap.last == event.usage and
+                pending[-1][1].cumulative + snap.last == snap.cumulative):
+            coverage[index] = [r for _, r in pending]
+            assignments.update((n, index) for n, _ in pending)
+            trusted.add(index)
+
+    events = []
+    for index, (snap, _, event, _) in enumerate(ledger):
+        if event is None:
+            continue
+        covered = coverage.get(index)
+        if not covered:
+            previous_at = ledger[index - 1][0].at if index else None
+            pending = [r for n, r in enumerate(records) if n not in assignments and r.at and event.at and
+                       (previous_at is None or r.at > previous_at) and r.at <= event.at]
+            if pending and (event.usage != snap.last or any(r.usage == snap.last for r in pending)):
+                # With no shared counter domain an overlapping aggregate is
+                # not an independent bill. Keep only a distinguishable actual
+                # last request; expose the unprovable remainder to the user.
+                issues["unreconciled_usage_intervals"] += 1
+                if snap.last and snap.last.total_tokens and not any(r.usage == snap.last for r in pending):
+                    events.append(replace(event, usage=snap.last, request_input=snap.last.input_tokens,
+                                          request_detail_uncertain=False))
+            else:
+                events.append(event)
+            continue
+        amount = sum((record.usage for record in covered), Usage())
+        remainder = usage_remainder(event.usage, amount)
+        if remainder is not None and not remainder.total_tokens:
+            continue
+        if remainder is not None and index in trusted:
+            # Preserve the original model/time for legacy-only historical usage.
+            known_request = remainder == snap.last
+            events.append(replace(event, usage=remainder,
+                                  request_input=remainder.input_tokens if known_request else None,
+                                  request_detail_uncertain=not known_request))
+        else:
+            # A context estimate or reset is not extra response usage. Expose
+            # the ambiguity rather than invent a price for an unmatched residual.
+            issues["unreconciled_usage_intervals"] += 1
+    reset_indices = set()
+    for number, record in enumerate(records):
+        if record.usage.total_tokens:
+            index = assignments.get(number)
+            prior_event = ledger[index][2] if index is not None else None
+            reset = bool(prior_event and prior_event.reset and index not in reset_indices)
+            if reset:
+                reset_indices.add(index)
+            events.append(Event(session.session_id, record.at, record.model, record.usage,
+                                record.usage.input_tokens, reset))
+    session.events = sorted(events, key=lambda e: e.at or datetime.max.replace(tzinfo=UTC))
 
 
 def price_overrides(values: list, base: dict) -> dict:
@@ -1083,7 +1314,7 @@ class QueryScheduler:
         self.tasks = []
         self.catalog = None
         self.live = (None, "Fetching live quota")
-        self.price_error = False
+        self.price_error = None
 
     def launch(self, coroutine):
         task = asyncio.create_task(coroutine)
@@ -1114,15 +1345,16 @@ class QueryScheduler:
             await asyncio.sleep(3600)
             try:
                 catalog = await load_price_catalog_async()
-            except (OSError, ValueError):
-                self.price_error = True
+            except (OSError, ValueError) as exc:
+                # Categorize from the typed cause, never echo arbitrary error data.
+                self.price_error = "invalid price data" if isinstance(exc.__cause__, (ValueError, RecursionError)) and not isinstance(exc.__cause__, DownloadError) else "download failed"
             else:
-                self.catalog, self.price_error = catalog, False
+                self.catalog, self.price_error = catalog, None
 
     def snapshot(self) -> tuple:
         catalog = self.catalog
         if self.price_error:
-            catalog = replace(catalog, warnings=(*catalog.warnings, "Price refresh failed; using the last valid prices in memory."))
+            catalog = replace(catalog, warnings=(*catalog.warnings, f"Price refresh failed ({self.price_error}); using the last valid prices in memory."))
         return catalog, copy.deepcopy(self.live)
 
     async def stop(self) -> None:
@@ -1227,6 +1459,11 @@ def projections(rows: list, current: Optional[dict], now: datetime) -> dict:
 
 ISSUES = {
     "missing_roots": "Scan directory does not exist", "unreadable_roots": "Unreadable directories",
+    "invalid_usage_records": "Invalid response usage records skipped",
+    "duplicate_usage_records_removed": "Duplicate response usage records removed",
+    "inherited_usage_records_excluded": "Inherited response usage records excluded",
+    "conflicting_usage_records": "Conflicting response receipts; first observed usage retained",
+    "unreconciled_usage_intervals": "Uncertain legacy coverage excluded; response usage retained",
     "unreadable_files": "Unreadable files", "malformed_json_lines": "Malformed JSON lines skipped",
     "invalid_usage_snapshots": "Invalid usage snapshots skipped", "pending_partial_line": "Incomplete log lines pending",
     "counter_component_corrections": "Counter component corrections detected",
@@ -1246,11 +1483,55 @@ def bounds(args: argparse.Namespace, calendar: Calendar, now: datetime) -> tuple
     elif args.since:
         start = calendar.midnight(date.fromisoformat(args.since))
     else:
-        start = now - timedelta(days=args.days) if args.days else None
+        days = 30 if args.days is None else args.days
+        start = now - timedelta(days=days) if days else None
     end = calendar.midnight(date.fromisoformat(args.until) + timedelta(days=1)) if args.until else now
-    if start and start >= end:
+    if start and (start > end or (start == end and not args.today)):
         raise ValueError("Start must precede end; use both --since and --until for historical reports")
     return start, end
+
+
+def report_bounds(args: argparse.Namespace, calendar: Calendar, now: datetime,
+                  current: Optional[dict], estimates: dict) -> tuple:
+    start, end = bounds(args, calendar, now)
+    if args.today or args.since or args.until or args.days is not None:
+        return start, end, {"selection": "explicit"}
+    available = [(kind, estimate) for kind, estimate in estimates.items() if estimate["available"]]
+    if available:
+        # Prefer the longest validated account window; never infer a calendar reset.
+        kind, estimate = max(available, key=lambda item: item[1]["period"]["window_minutes"])
+        return timestamp(estimate["period"]["start"]), now, {
+            "selection": "current_cycle", "cycle_window": kind,
+            "cycle_resets_at": estimate["period"]["resets_at"]}
+    reason = "Quota lookup is disabled" if current is None else current.get("error")
+    if not reason:
+        reason = "; ".join(dict.fromkeys(e["reason"] for e in estimates.values() if e.get("reason")))
+    return start, end, {"selection": "fallback", "fallback_reason": reason or "No valid current quota window"}
+
+
+def period_summaries(rows: list, summary: dict, period: dict, now: datetime) -> list:
+    """Independent local totals; overlapping periods are never added together."""
+    fields = Bucket().export().keys()
+    selected = {"name": "Selected", "period": dict(period), "source": "local_session_logs",
+                "summary": {**{key: summary[key] for key in fields},
+                            "by_model": summary["by_model"], "by_model_detail": summary["by_model_detail"]}}
+    periods = [selected]
+    start = now - timedelta(days=30)
+    if timestamp(period["start"]) == start and timestamp(period["end"]) == now:
+        selected["also_last_30_days"] = True
+        return periods
+    local, models = Bucket(), defaultdict(Bucket)
+    for event, cost in rows:
+        if included(event.at, start, now):
+            local.add(event, cost)
+            models[event.model].add(event, cost)
+    periods.append({"name": "Last 30 days", "source": "local_session_logs",
+                    "period": {"start": start.isoformat(), "end": now.isoformat(),
+                               "timezone": period["timezone"], "end_exclusive": True},
+                    "summary": {**local.export(),
+                                "by_model": {key: asdict(value.usage) for key, value in sorted(models.items())},
+                                "by_model_detail": {key: value.export() for key, value in sorted(models.items())}}})
+    return periods
 
 
 @dataclass
@@ -1299,14 +1580,16 @@ def report(args: argparse.Namespace, scanner: Scanner, prices: dict, calendar: C
     rows = cache.rows
     issues = cache.issues.copy()
     issues.update(scanner.issues)
-    start, end = bounds(args, calendar, now)
-    summary = cache.summarize(calendar, start, end, args.by)
     current = quota_status(args.quota, rollouts, live, now, args.limit_id)
+    estimates = projections(rows, current, now)
+    start, end, selection = report_bounds(args, calendar, now, current, estimates)
+    summary = cache.summarize(calendar, start, end, args.by)
     summary["current_rate_limits"] = current
-    summary["cycle_estimates"] = projections(rows, current, now)
+    summary["cycle_estimates"] = estimates
+    period = {"start": start.isoformat() if start else None, "end": end.isoformat() if end else None,
+              "timezone": calendar.name, "end_exclusive": True, **selection}
     return {"version": VERSION, "generated_at": now.isoformat(),
-            "period": {"start": start.isoformat() if start else None, "end": end.isoformat() if end else None,
-                       "timezone": calendar.name, "end_exclusive": True},
+            "period": period, "period_summaries": period_summaries(rows, summary, period, now),
             "roots": [str(p) for p in roots],
             "projection_assumptions": ["Account usage primarily occurs on this machine", "Quota consumption is approximately proportional to local API-equivalent cost",
                 "Future model and cache mix remains similar", "Account percentages may be rounded", "Account ownership of log snapshots cannot be independently verified"],
@@ -1357,12 +1640,13 @@ def money(row: dict) -> str:
     return f"${known:,.4f} + unknown" if known else "unknown"
 
 
-def table(headers: list, rows: list, terminal_width: int = 120) -> list:
+def table(headers: list, rows: list, terminal_width: int = 120, numeric_limit: Optional[int] = 18) -> list:
     if not rows:
         return ["  No records"]
     first_width = max(12, min(40, terminal_width - 56))
-    limits = [first_width] + [18] * (len(headers) - 1)
-    clean = [[fit(v, limits[i]) for i, v in enumerate(row)] for row in [headers] + rows]
+    limits = [first_width] + [numeric_limit] * (len(headers) - 1)
+    clean = [[fit(v, limits[i]) if limits[i] is not None else safe_text(v)
+              for i, v in enumerate(row)] for row in [headers] + rows]
     widths = [max(width(row[i]) for row in clean) for i in range(len(headers))]
     lines = []
     for index, row in enumerate(clean):
@@ -1397,7 +1681,7 @@ def wrap_cells(value: str, limit: int) -> list:
 def panel(title: str, rows: list, columns: int, wrap: bool = True) -> list:
     columns = max(8, columns)
     inner = columns - 4
-    heading = fit(title, inner)
+    heading = fit(title, columns - 5)
     top = "╭─ " + heading + " " + "─" * max(0, columns - width(heading) - 5) + "╮"
     body = []
     for raw in rows:
@@ -1426,16 +1710,23 @@ def progress(used: Optional[float], columns: int) -> str:
     return "█" * filled + "░" * (bar_width - filled) + f"  {used:g}% used · {remaining:g}% left"
 
 
-def cycle_card(kind: str, estimate: dict, calendar: Calendar, columns: int, compact: bool, multiple: bool) -> list:
-    title = "Current cycle" + (" · " + kind.replace("_", " ").title() if multiple else "")
+def cycle_card(kind: str, estimate: dict, calendar: Calendar, columns: int, compact: bool,
+               window: Optional[dict] = None) -> list:
+    title = "Current cycle · " + kind.replace("_", " ").title()
     if not estimate["available"]:
-        return panel(title, ["Unavailable", estimate.get("reason") or "Insufficient data"], columns, wrap=not compact)
+        body = ["Local cycle unavailable: " + (estimate.get("reason") or "Insufficient data")]
+        if window:
+            body = ["Account: " + progress(window.get("used_percent"), columns - 12),
+                    "Resets " + calendar.display(timestamp(window.get("resets_at_utc"))), *body]
+        return panel(title, body, columns)
     period, account, local = estimate["period"], estimate["account_usage"], estimate["local"]
     usage = local["usage"]
     partial = local["estimate_is_partial"]
     if partial:
         title += " · PARTIAL"
-    body = [progress(account.get("used_percent"), columns - 4)]
+    body = ["Account: " + progress(account.get("used_percent"), columns - 12)]
+    if not local["token_events"]:
+        body.append("No local usage records in this cycle")
     local_cost = f"${local['known_api_cost_usd']:,.6f}" + (" + unknown" if partial else "")
     total = f"~${estimate['projected_full_cycle_known_api_cost_usd']:,.4f}" if estimate["projection_available"] else "unavailable"
     remaining = f"~${estimate['projected_remaining_known_api_cost_usd']:,.4f}" if estimate["projection_available"] else "unavailable"
@@ -1451,10 +1742,10 @@ def cycle_card(kind: str, estimate: dict, calendar: Calendar, columns: int, comp
     display = (lambda v: calendar.local(timestamp(v)).strftime("%m-%d %H:%M")) if compact else (lambda v: calendar.display(timestamp(v)))
     if compact:
         body.append(f"{display(period['start'])} → {display(period['resets_at'])}")
-        body.append(f"As of {display(period['as_of'])} · {usage['total_tokens']:,} tokens")
+        body.append(f"Local through {display(period['as_of'])} · {usage['total_tokens']:,} tokens")
     else:
         body += ["Started  " + display(period["start"]), "Resets   " + display(period["resets_at"]),
-                 "As of    " + display(period["as_of"]), "",
+                 "Local through " + display(period["as_of"]), "",
                  f"Tokens: {usage['total_tokens']:,} total · {usage['input_tokens']:,} in · {usage['cached_input_tokens']:,} cached · {usage['output_tokens']:,} out",
                  f"Cache write: {usage['cache_write_input_tokens']:,} · Reasoning: {usage['reasoning_output_tokens']:,}",
                  f"Sessions: {local['sessions']:,} · Events: {local['token_events']:,}"]
@@ -1462,21 +1753,23 @@ def cycle_card(kind: str, estimate: dict, calendar: Calendar, columns: int, comp
         body.append(f"Fully priced tokens: {percentage(usage['total_tokens'] - missing, usage['total_tokens'])}")
     if not estimate["projection_available"] and not compact:
         body.append("Projection unavailable: " + (estimate.get("reason") or "Insufficient data"))
-    return panel(title, body, columns, wrap=not compact)
+    return panel(title, body, columns, wrap=not compact or columns < 40)
 
 
-def cycle_lines(estimates: dict, calendar: Calendar, compact: bool = False, columns: int = 120) -> list:
+def cycle_lines(estimates: dict, calendar: Calendar, compact: bool = False, columns: int = 120,
+                windows: Optional[dict] = None) -> list:
     items = list(estimates.items())
+    windows = windows or {}
     lines = []
     # Paired cards keep every cycle's money visible in a standard watch screen.
     if compact and len(items) == 2 and columns >= 96:
         size = (columns - 2) // 2
-        cards = [cycle_card(kind, value, calendar, size, True, True) for kind, value in items]
+        cards = [cycle_card(kind, value, calendar, size, True, windows.get(kind)) for kind, value in items]
         return side_by_side(cards, columns)
     for kind, value in items:
         if lines:
             lines.append("")
-        lines += cycle_card(kind, value, calendar, columns, compact, len(items) > 1)
+        lines += cycle_card(kind, value, calendar, columns, compact, windows.get(kind))
     return lines
 
 
@@ -1532,72 +1825,149 @@ def terminal_ansi() -> tuple:
         return False, None
 
 
+def usage_rows(row: dict) -> list:
+    tokens = row["usage"]
+    return [f"Input {tokens['input_tokens']:,} · Cached {tokens['cached_input_tokens']:,} · Output {tokens['output_tokens']:,} · Reasoning {tokens['reasoning_output_tokens']:,} · Total {tokens['total_tokens']:,}",
+            f"Cache write {tokens['cache_write_input_tokens']:,} · Cached/In {percentage(tokens['cached_input_tokens'], tokens['input_tokens'])} · Out/Total {percentage(tokens['output_tokens'], tokens['total_tokens'])}",
+            f"API cost {money(row)} · Sessions {row['sessions']:,} · Events {row['token_events']:,}"]
+
+
+def statistics_rows(entries: list, columns: int, total: bool = True, name: str = "Name") -> tuple:
+    """Shared period/model layout, with a lossless narrow-screen fallback."""
+    inner = columns - 4
+    if columns >= 120 and entries:
+        rows = []
+        for key, row in entries:
+            tokens = row["usage"]
+            total_cell = (f"{tokens['total_tokens']:,}",) if total else ()
+            rows.append((key, f"{tokens['input_tokens']:,}", f"{tokens['cached_input_tokens']:,}",
+                         f"{tokens['output_tokens']:,}", f"{tokens['reasoning_output_tokens']:,}", *total_cell,
+                         percentage(tokens['cached_input_tokens'], tokens['input_tokens']),
+                         percentage(tokens['output_tokens'], tokens['total_tokens']), money(row)))
+        headers = [name, "Input", "Cached", "Output", "Reasoning"] + (["Total"] if total else [])
+        table_lines = [line[2:] for line in table(headers + ["Cached/In", "Out/Total", "API Cost"], rows, inner,
+                                               numeric_limit=None)]
+        if all(width(line) <= inner for line in table_lines):
+            return table_lines, True
+    body = []
+    for key, row in entries:
+        if body:
+            body.append("")
+        body += [f"{safe_text(key)} · API cost {money(row)}", *usage_rows(row)[:2],
+                 f"Sessions {row['sessions']:,} · Events {row['token_events']:,}"]
+    return body, False
+
+
+def periods_panel(data: dict, args: argparse.Namespace, calendar: Calendar, columns: int) -> list:
+    summary, selected = data["summary"], data["period"]
+    # Older callers can still render the original report shape without new keys.
+    periods = data.get("period_summaries") or [{"name": "Selected", "period": selected, "summary": summary}]
+    lines = []
+    for item in periods:
+        period, row = item["period"], item["summary"]
+        selection = period.get("selection")
+        is_selected = item["name"] == "Selected"
+        if is_selected:
+            title = "This cycle · Selected" if selection == "current_cycle" else "Selected period"
+            if item.get("also_last_30_days"):
+                title = "Last 30 days · Selected"
+        else:
+            title = "Last 30 days · Reference"
+        body = ["Usage source: Local Codex session logs",
+                f"From {calendar.display(timestamp(period['start']))} → {calendar.display(timestamp(period['end']))}"]
+        if is_selected and selection == "current_cycle":
+            body.append("Cycle window: " + period["cycle_window"].replace("_", " ").title())
+        elif is_selected and selection == "fallback":
+            body.append("Fallback: last 30 days · " + safe_text(period["fallback_reason"]))
+        elif is_selected and selection == "explicit":
+            body.append("Explicit date range")
+        if item.get("also_last_30_days"):
+            body.append("Selected also covers the last 30 days")
+        elif not is_selected:
+            body.append("Reference · periods may overlap; totals are separate")
+        if data.get("pricing"):
+            pricing = data["pricing"]
+            body.append(f"Prices: {pricing['catalog_source']} · checked {pricing['verified_at']}" + (" · STALE" if pricing.get("stale") else ""))
+        body += ["", "By model"]
+        entries = sorted(row["by_model_detail"].items(), key=lambda value: (-value[1]["usage"]["total_tokens"], value[0]))
+        shown = entries[:args.top] if args.top else entries
+        if not entries:
+            body.append("No local usage records in this cycle" if is_selected and selection == "current_cycle"
+                        else "No local usage records in this report period")
+        # The footer uses the full period bucket, including models hidden by --top.
+        # Ratios are recalculated from aggregate counters; session counts stay unique.
+        model_rows, _ = statistics_rows([*shown, ("Total", row)], columns)
+        body += model_rows
+        if len(shown) < len(entries):
+            body.append(f"Showing {len(shown)}/{len(entries)} models; Total covers all models. --top 0 shows all. JSON is always complete.")
+        if lines:
+            lines.append("")
+        lines += panel(title, body, columns)
+    return lines
+
+
+def account_panel(current: dict, estimates: dict, args: argparse.Namespace,
+                  calendar: Calendar, compact: bool, columns: int) -> list:
+    title = "Account quota & Current cycle" if args.project else "Account quota"
+    if current.get("source") == "unavailable" or current.get("error"):
+        return panel(title, ["Unavailable: " + safe_text(current.get("error") or "Quota unavailable")], columns)
+    bid = current["active_limit_id"]
+    bucket = current["limits"][bid]
+    source = "LIVE" if current["source"] == "app_server" else "LOG SNAPSHOT"
+    age = bucket.get("snapshot_age_seconds")
+    age_label = f"{age}s ago" if age is not None else "time unknown"
+    body = [f"{source} · {safe_text(bid)} · {safe_text(bucket.get('plan_type') or 'plan unknown')} · {age_label}"]
+    if any((bucket.get(kind) or {}).get("used_percent", 0) or 0
+           for kind in ("primary", "secondary", "individual_limit")):
+        body.append("Quota is account-wide; local logs cover only recorded local sessions.")
+    if args.project and estimates:
+        body += cycle_lines(estimates, calendar, compact, columns - 4, bucket)
+    else:
+        for kind in ("primary", "secondary", "individual_limit"):
+            window = bucket.get(kind)
+            if window:
+                stale = " [expired]" if window.get("expired") else ""
+                body += [f"{kind.replace('_', ' ').title()}: {progress(window.get('used_percent'), columns - 20)}{stale}",
+                         "Resets " + calendar.display(timestamp(window.get("resets_at_utc")))]
+        if args.project:
+            body.append("Local cycle unavailable: No quota windows available")
+    if len(current["limits"]) > 1:
+        body.append("Other buckets: " + ", ".join(safe_text(k) for k in sorted(current["limits"]) if k != bid) + " (--limit)")
+    if current.get("fallback_reason"):
+        body.append("Fallback: " + safe_text(current["fallback_reason"]))
+    credits = bucket.get("credits")
+    if credits:
+        balance = safe_text(credits.get("balance") if credits.get("balance") is not None else "unknown")
+        body.append(f"Credits: {'unlimited' if credits.get('unlimited') else balance}")
+    reset_credits = current.get("rate_limit_reset_credits")
+    if reset_credits:
+        body.append(f"Reset credits available: {reset_credits['available_count']}")
+    return panel(title, body, columns)
+
+
 def render(data: dict, args: argparse.Namespace, calendar: Calendar, columns: int = 120) -> str:
     columns = max(8, min(columns, 140))
     compact = args.command == "watch"
     summary, period = data["summary"], data["period"]
-    usage = summary["usage"]
     current = summary["current_rate_limits"]
     source = {"app_server": "LIVE", "session_log": "LOG SNAPSHOT", "unavailable": "QUOTA UNAVAILABLE"}.get(
         current.get("source") if current else None, "LOCAL LOGS")
     lines = [f"OAI USAGE  {VERSION}   /   USAGE & QUOTA",
              f"Report: {calendar.display(timestamp(period['start']))} → {calendar.display(timestamp(period['end']))} · {source}"]
-    if args.project and current:
-        estimates = summary["cycle_estimates"]
-        if estimates:
-            lines += cycle_lines(estimates, calendar, compact, columns)
-        else:
-            lines += panel("Current cycle", ["Unavailable: " + (current.get("error") or "No quota windows available")], columns)
+    if current:
+        lines += account_panel(current, summary["cycle_estimates"], args, calendar, compact, columns)
         lines.append("")
 
-    report_rows = [f"API cost  {money(summary)}   ·   {usage['total_tokens']:,} tokens   ·   {summary['sessions']:,} sessions",
-                   f"Input {usage['input_tokens']:,}  ·  Cached {usage['cached_input_tokens']:,}  ·  Output {usage['output_tokens']:,}"]
-    if not compact:
-        report_rows += [f"Cache write {usage['cache_write_input_tokens']:,}  ·  Reasoning {usage['reasoning_output_tokens']:,}  ·  Events {summary['token_events']:,}",
-                        f"Cached/In {percentage(usage['cached_input_tokens'], usage['input_tokens'])}  ·  Out/Total {percentage(usage['output_tokens'], usage['total_tokens'])}",
-                        f"From {calendar.display(timestamp(period['start']))} to {calendar.display(timestamp(period['end']))}"]
-    if data.get("pricing"):
-        pricing = data["pricing"]
-        report_rows.append(f"Prices: {pricing['catalog_source']} · checked {pricing['verified_at']}" + (" · STALE" if pricing.get("stale") else ""))
-    lines += panel("Selected report period", report_rows, columns, wrap=not compact)
-
-    # Compact watch already has the quota bar and dates inside each cycle card.
-    if current and (not compact or not args.project):
-        quota_rows = []
-        if current.get("source") == "unavailable" or current.get("error"):
-            quota_rows.append(current.get("error", "Unavailable"))
-        else:
-            bid = current["active_limit_id"]
-            bucket = current["limits"][bid]
-            label = "LIVE" if current["source"] == "app_server" else "LOG SNAPSHOT"
-            age = bucket.get("snapshot_age_seconds")
-            age_label = f"{age}s ago" if age is not None else "time unknown"
-            quota_rows.append(f"{label} · {safe_text(bid)} · {safe_text(bucket.get('plan_type') or 'plan unknown')} · {age_label}")
-            for kind in ("primary", "secondary", "individual_limit"):
-                window = bucket.get(kind)
-                if window:
-                    stale = " [expired]" if window.get("expired") else ""
-                    quota_rows.append(f"{kind.replace('_', ' ').title()}: {progress(window.get('used_percent'), columns - 20)}{stale}")
-                    quota_rows.append("Resets " + calendar.display(timestamp(window.get("resets_at_utc"))))
-            if len(current["limits"]) > 1:
-                quota_rows.append("Other buckets: " + ", ".join(safe_text(k) for k in sorted(current["limits"]) if k != bid) + " (--limit)")
-            if current.get("fallback_reason"):
-                quota_rows.append("Fallback: " + safe_text(current["fallback_reason"]))
-            credits = bucket.get("credits")
-            if credits:
-                balance = safe_text(credits.get("balance") if credits.get("balance") is not None else "unknown")
-                quota_rows.append(f"Credits: {'unlimited' if credits.get('unlimited') else balance}")
-            reset_credits = current.get("rate_limit_reset_credits")
-            if reset_credits:
-                quota_rows.append(f"Reset credits available: {reset_credits['available_count']}")
-        lines += ["", *panel("Account quota", quota_rows, columns)]
+    selection = period.get("selection")
+    empty_message = ("No local usage records in this cycle" if selection == "current_cycle"
+                     else "No local usage records in this report period")
+    lines += periods_panel(data, args, calendar, columns)
 
     dimensions = ["model", "day", "session"] if args.all_dimensions else [args.by]
     for by in dimensions:
         if by == "model":
-            entries = list(summary["by_model_detail"].items())
-            title = "By model"
-        elif by == "session":
+            continue  # Every period already includes its own model breakdown.
+        if by == "session":
             entries = [(r["session_id"], r) for r in summary["by_session"]]
             title = "By session (including independent subtasks)"
         else:
@@ -1606,45 +1976,16 @@ def render(data: dict, args: argparse.Namespace, calendar: Calendar, columns: in
         entries.sort(key=(lambda row: (-row[1]["usage"]["total_tokens"], row[0])) if by in ("model", "session") else (lambda row: row[0]),
                      reverse=by not in ("model", "session"))
         shown = entries[:args.top] if args.top else entries
-        lines += ["", title, "─" * columns]
-        wide = columns >= 120
-        if wide:
-            rows = []
-            for key, row in shown:
-                tokens = row["usage"]
-                total = (f"{tokens['total_tokens']:,}",) if by == "model" else ()
-                rows.append((key, f"{tokens['input_tokens']:,}", f"{tokens['cached_input_tokens']:,}",
-                             f"{tokens['output_tokens']:,}", *total, f"{tokens['reasoning_output_tokens']:,}",
-                             percentage(tokens['cached_input_tokens'], tokens['input_tokens']),
-                             percentage(tokens['output_tokens'], tokens['total_tokens']), money(row)))
-            headers = ["Name", "Input", "Cached", "Output"] + (["Total"] if by == "model" else [])
-            table_lines = table(headers + ["Reasoning", "Cached/In", "Out/Total", "API Cost"], rows, columns)
-            # Large model counters can overflow even a wide screen; keep their totals and costs visible.
-            wide = by != "model" or all(width(line) <= columns for line in table_lines)
-        if wide:
-            lines += table_lines
-        else:
-            for key, row in shown:
-                tokens = row["usage"]
-                lines.append(f"  {safe_text(key)}  ·  {money(row)}")
-                token_line = f"  In {tokens['input_tokens']:,} · Cached {tokens['cached_input_tokens']:,} · Out {tokens['output_tokens']:,}"
-                if by == "model":
-                    total = f" · Total {tokens['total_tokens']:,}"
-                    if width(token_line + total) <= columns:
-                        token_line += total
-                    else:
-                        lines.append(token_line)
-                        token_line = f"  Total {tokens['total_tokens']:,}"
-                lines.append(token_line)
-                if not compact:
-                    lines.append(f"  Reasoning {tokens['reasoning_output_tokens']:,} · Cached/In {percentage(tokens['cached_input_tokens'], tokens['input_tokens'])} · Out/Total {percentage(tokens['output_tokens'], tokens['total_tokens'])}")
-            if not shown:
-                lines.append("  No records")
+        body, _ = statistics_rows(shown, columns, total=by == "model")
+        if not body:
+            body.append(empty_message)
         if len(shown) < len(entries):
-            lines.append(f"Showing {len(shown)}/{len(entries)} entries; --top 0 shows all. JSON is always complete.")
+            body.append(f"Showing {len(shown)}/{len(entries)} entries; --top 0 shows all. JSON is always complete.")
+        lines += ["", *panel(title, body, columns)]
     issues = data["diagnostics"]["issues"]
     warnings = [(ISSUES.get(k, k), v) for k, v in issues.items() if v and k not in (
-        "inherited_snapshots_excluded", "duplicate_snapshots_removed", "events_without_request_detail", "inherited_baseline_tokens_excluded")]
+        "inherited_snapshots_excluded", "duplicate_snapshots_removed", "events_without_request_detail", "inherited_baseline_tokens_excluded",
+        "duplicate_usage_records_removed", "inherited_usage_records_excluded")]
     if summary["unpriced_models"]:
         warnings.append(("Unpriced models", ", ".join(safe_text(v) for v in summary["unpriced_models"])))
     if summary["undated_events_excluded"]:
@@ -1656,7 +1997,7 @@ def render(data: dict, args: argparse.Namespace, calendar: Calendar, columns: in
     if args.project and current:
         lines.append("Estimates = local cycle cost / account usage fraction; assume usage primarily on this machine.")
     if not summary["token_events"]:
-        lines.append("No usage in this report period; try --days all or --root to select log directories.")
+        lines += wrap_cells("Try --days all or --root to select local log directories.", columns)
     return "\n".join(fit(line, columns) for line in lines)
 
 
@@ -1707,7 +2048,7 @@ def parse_args(argv: Optional[list] = None) -> argparse.Namespace:
         allow_abbrev=False,
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""Examples:
-  oai-usage                         Last 30 days and current quota-cycle costs
+  oai-usage                         Current account cycle (30-day fallback)
   oai-usage --today                  Today in the selected timezone
   oai-usage watch                    Live dashboard; Ctrl+C to quit
   oai-usage --days all --by session  All session details
@@ -1719,7 +2060,7 @@ def parse_args(argv: Optional[list] = None) -> argparse.Namespace:
     for name, help_text in (("report", "Usage report (default)"), ("watch", "Continuously refresh usage")):
         p = sub.add_parser(name, help=help_text, description=help_text, allow_abbrev=False)
         dates = p.add_mutually_exclusive_group()
-        dates.add_argument("--days", type=days_value, default=30, metavar="N|all", help="Last N x 24 hours; all for all history (default: 30)")
+        dates.add_argument("--days", type=days_value, default=None, metavar="N|all", help="Last N x 24 hours; all for all history (default: current cycle, or 30 days if unavailable)")
         dates.add_argument("--today", action="store_true", help="Today in the selected timezone")
         dates.add_argument("--since", metavar="YYYY-MM-DD", help="Inclusive start date")
         p.add_argument("--until", metavar="YYYY-MM-DD", help="Inclusive end date")
@@ -1809,6 +2150,7 @@ async def run_command(args: argparse.Namespace, scheduler: QueryScheduler) -> in
     scanner = Scanner()
     cache = ReportCache()
     screen_started = False
+    scrollback = False
     try:
         count = 0
         while True:
@@ -1827,22 +2169,28 @@ async def run_command(args: argparse.Namespace, scheduler: QueryScheduler) -> in
             else:
                 size = shutil.get_terminal_size((120, 40))
                 body = render(data, args, calendar, size.columns)
-                if tty_watch:
+                lines = [fit(line, size.columns) for line in body.splitlines()]
+                if tty_watch and not scrollback and len(lines) > max(1, size.lines - 3):
+                    scrollback = True
+                    if screen_started:
+                        sys.stdout.write("\033[?1049l\033[?25h")
+                        screen_started = False
+                    print("\n".join(wrap_cells(
+                        "Full report exceeds terminal height; watch uses scrollback. "
+                        "Scroll to view both periods and totals; Ctrl+C to stop.", size.columns)))
+                footer = fit(f"Refresh {args.refresh:g}s · {datetime.now().strftime('%H:%M:%S')} · Ctrl+C to quit", size.columns)
+                if tty_watch and not scrollback:
                     if not screen_started:
                         sys.stdout.write("\033[?1049h\033[?25l")
                         screen_started = True
-                    footer = fit(f"Refresh {args.refresh:g}s · {datetime.now().strftime('%H:%M:%S')} · Ctrl+C to quit", size.columns)
-                    lines = [fit(line, size.columns) for line in body.splitlines()]
-                    available = max(1, size.lines - 3)
-                    if len(lines) > available:
-                        notice = fit("… Full details: oai-usage --all or --output report.json", size.columns)
-                        lines = lines[:max(0, available - 1)] + [notice]
                     if colors:
                         lines = [style_line(line) for line in lines]
                     sys.stdout.write("\033[H\033[2J" + "\n".join(lines) + "\n\n" + footer)
                     sys.stdout.flush()
                 else:
-                    print("\n".join(style_line(line) for line in body.splitlines()) if colors else body, flush=True)
+                    print("\n".join(style_line(line) for line in lines) if colors else body, flush=True)
+                    if tty_watch:
+                        print(footer + "\n", flush=True)
                     if args.output:
                         print(f"\nJSON saved: {args.output}")
             count += 1
