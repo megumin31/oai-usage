@@ -73,7 +73,7 @@ Run directly in PowerShell 7:
 curl.exe -fsSL https://raw.githubusercontent.com/megumin31/oai-usage/main/oai-usage | python -
 ```
 
-Windows examples explicitly use `curl.exe` to avoid the different `curl` alias in older PowerShell versions. If `python` is missing or opens the Microsoft Store, but `py --version` works, replace `python` with `py`. No additional Python dependencies are required.
+Windows examples explicitly use `curl.exe` to avoid the different `curl` alias in older PowerShell versions. If `python` is missing or opens the Microsoft Store, but `py --version` works, replace `python` with `py`. The default local time zone and `--timezone UTC` need no extra dependencies. For IANA names such as `--timezone America/New_York`, run `python -m pip install tzdata` if the system has no time-zone database, as is typical on Windows.
 
 After downloading the script to your current directory, you can also run:
 
@@ -148,7 +148,7 @@ Price errors distinguish download failures from invalid catalog data, including 
 
 Logs are read from `sessions` and `archived_sessions` under `$CODEX_HOME` (or `~/.codex` when unset); `--root` replaces these directories. Original logs are read-only, with no log uploads or credential-content reads. `--json` emits complete data; watch emits one JSON line per frame. `period.selection` identifies `current_cycle`, `explicit`, or `fallback`. Current-cycle reports include `cycle_window` and `cycle_resets_at`; fallback reports include `fallback_reason`. Existing usage, cost, and grouping JSON fields are retained. The additive `period_summaries` field provides local totals, complete `by_model` / `by_model_detail` breakdowns, bounds, and sources for each period; the reference does not change the original `period` or `summary`. `--output` cannot overwrite the program or JSONL logs.
 
-Dates use the local time zone by default. UTC needs no extra data; other named time zones depend on the system time-zone database. Terminal dates show the actual offset at that point in time as `UTC±HH:MM`, or `UTC` for a zero offset.
+Dates use the local time zone by default. UTC needs no extra data; other named time zones use the system IANA database or the first-party [`tzdata`](https://docs.python.org/3/library/zoneinfo.html#data-sources) package. Missing named zones produce a hint to check the name or install `tzdata`. Terminal dates show the actual offset at that point in time as `UTC±HH:MM`, or `UTC` for a zero offset.
 
 ## Development and testing
 
@@ -157,10 +157,11 @@ Maintain `oai-usage` directly, without a build step. Actions run [`scripts/updat
 Run tests:
 
 ```sh
+python3 -m pip install tzdata
 python3 -W error::ResourceWarning -m unittest discover -s tests -q
 ```
 
-CI covers Ubuntu and Windows using a simulated app-server. Real Windows account queries, cycle projections, and Ctrl+C cleanup still need verification on a Windows machine.
+`tzdata` is a full-suite test dependency so named-zone, DST, and midnight-boundary tests all run. CI installs it on Ubuntu and Windows and sets an empty `PYTHONTZPATH` to exercise the package data source. The app-server is simulated in tests. Real Windows account queries, cycle projections, and Ctrl+C cleanup still need verification on a Windows machine.
 
 ## License
 

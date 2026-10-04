@@ -157,23 +157,77 @@ class ResponseLedgers(unittest.TestCase):
 
 
 class InputAndPeriods(unittest.TestCase):
-    def test_complete_invalid_tail_matches_newline_and_is_not_replayed(self):
-        depth = 100000
-        row = (b'{"type":"event_msg","payload":{"type":"token_count","rate_limits":{"credits":{"balance":' +
-               b'[' * depth + b'0' + b']' * depth + b'}}}}')
+    def check_skipped_complete_record(self, row, ingest_error=None):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / 'a.jsonl'
             for ending in (b'\n', b''):
                 path.write_bytes(row + ending)
                 scanner = M['Scanner']()
-                logs = scanner.scan([path.parent])
+                patch_ingest = (patch.object(M['Rollout'], 'ingest', side_effect=ingest_error)
+                                if ingest_error else contextlib.nullcontext())
+                with patch_ingest:
+                    logs = scanner.scan([path.parent])
                 self.assertEqual(logs[0].issues['malformed_json_lines'], 1)
+                self.assertNotIn('pending_partial_line', logs[0].issues)
                 self.assertEqual(logs[0].offset, path.stat().st_size)
                 with path.open('ab') as stream:
                     stream.write(b'\n' + json.dumps(meta()).encode() + b'\n')
                 logs = scanner.scan([path.parent])
                 self.assertEqual(logs[0].issues['malformed_json_lines'], 1)
                 self.assertTrue(logs[0].metadata_seen)
+
+    def test_invalid_balance_tail_matches_newline_and_is_not_replayed(self):
+        # Invalid by schema even at shallow depth; do not depend on C stack size.
+        for balance in ([0], {}, True, float('inf'), float('nan')):
+            with self.subTest(balance=balance):
+                row = {'type': 'event_msg', 'payload': {'type': 'token_count',
+                       'rate_limits': {'credits': {'balance': balance}}}}
+                self.check_skipped_complete_record(json.dumps(row).encode())
+
+    def test_ingest_recursion_failure_with_and_without_newline_is_not_replayed(self):
+        self.check_skipped_complete_record(json.dumps(meta()).encode(), RecursionError('nested record'))
+
+    def test_scalar_credit_balances_keep_their_values(self):
+        for balance in (None, '0', '1.2300', '', 0, 12, 1.25):
+            with self.subTest(balance=balance):
+                credits = M['normalize_bucket']({'credits': {'balance': balance}})['credits']
+                self.assertEqual(credits['balance'], None if balance is None else str(balance))
+
+    def test_broken_json_waits_for_newline_then_skips_once(self):
+        row = b'{"type":"session_meta","payload":invalid}'
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / 'a.jsonl'
+            for ending in (b'\n', b''):
+                with self.subTest(ending=ending):
+                    path.write_bytes(row + ending)
+                    scanner = M['Scanner']()
+                    log = scanner.scan([path.parent])[0]
+                    self.assertEqual(log.issues['malformed_json_lines'], int(bool(ending)))
+                    self.assertEqual(log.issues['pending_partial_line'], int(not ending))
+                    self.assertEqual(log.offset, path.stat().st_size if ending else 0)
+                    with path.open('ab') as stream:
+                        stream.write(b'\n' + json.dumps(meta()).encode() + b'\n')
+                    log = scanner.scan([path.parent])[0]
+                    self.assertEqual(log.issues['malformed_json_lines'], 1)
+                    self.assertNotIn('pending_partial_line', log.issues)
+                    self.assertTrue(log.metadata_seen)
+                    read = scanner.bytes_read
+                    scanner.scan([path.parent])
+                    self.assertEqual(scanner.bytes_read, read)
+
+    def test_missing_named_zone_gives_install_hint_while_local_and_utc_work(self):
+        def unavailable(name):
+            raise M['ZoneInfoNotFoundError'](name)
+        with patch.dict(G, {'ZoneInfo': unavailable}):
+            for zone in ('UTC', 'local'):
+                self.assertEqual(M['parse_args'](['--timezone', zone]).timezone, zone)
+            errors = io.StringIO()
+            with contextlib.redirect_stderr(errors), self.assertRaises(SystemExit) as caught:
+                M['parse_args'](['--timezone', 'America/New_York'])
+            self.assertEqual(caught.exception.code, 2)
+            self.assertIn('python -m pip install tzdata', errors.getvalue())
+            self.assertIn('check the zone name', errors.getvalue())
+            self.assertIn('--timezone local or UTC', errors.getvalue())
 
     def test_today_exact_midnight_empty_and_watch_advances_with_cache(self):
         class Clock(DT):

@@ -26,5 +26,9 @@ jobs:
         with:
           python-version: '3.x'
           check-latest: true
+      - name: Install IANA time zone data for calendar tests
+        run: python -m pip install tzdata
       - name: Verify async pipes, live cycle projections, cleanup, and all regressions
+        env:
+          PYTHONTZPATH: ''
         run: python -W error::ResourceWarning -m unittest discover -s tests -v

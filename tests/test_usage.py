@@ -308,10 +308,7 @@ class Accounting(unittest.TestCase):
         return M['Event']('session', at(), model, usage(n, out), request)
 
     def test_utc_and_local_midnight(self):
-        try:
-            cal = M['Calendar'].make('Asia/Shanghai')
-        except M['ZoneInfoNotFoundError']:
-            self.skipTest('System IANA time zone database is unavailable')
+        cal = M['Calendar'].make('Asia/Shanghai')
         stamp = at('2026-09-21T17:00:00Z')
         start = cal.midnight(M['date'](2026, 9, 22))
         self.assertEqual(start, at('2026-09-21T16:00:00Z'))
@@ -320,10 +317,7 @@ class Accounting(unittest.TestCase):
         self.assertFalse(M['included'](at('2026-09-22T16:00:00Z'), start, at('2026-09-22T16:00:00Z')))
 
     def test_named_timezone_dst_calendar_day(self):
-        try:
-            cal = M['Calendar'].make('America/New_York')
-        except M['ZoneInfoNotFoundError']:
-            self.skipTest('System IANA time zone database is unavailable')
+        cal = M['Calendar'].make('America/New_York')
         first = cal.midnight(M['date'](2026, 3, 8))
         second = cal.midnight(M['date'](2026, 3, 9))
         self.assertEqual((second - first).total_seconds(), 23 * 3600)

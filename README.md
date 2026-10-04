@@ -73,7 +73,7 @@ python --version
 curl.exe -fsSL https://raw.githubusercontent.com/megumin31/oai-usage/main/oai-usage | python -
 ```
 
-Windows 示例显式使用 `curl.exe`，避免旧版 PowerShell 的 `curl` 别名差异。如果 `python` 不存在或打开 Microsoft Store，但 `py --version` 正常，可将示例中的 `python` 替换为 `py`。无需额外安装 Python 依赖。
+Windows 示例显式使用 `curl.exe`，避免旧版 PowerShell 的 `curl` 别名差异。如果 `python` 不存在或打开 Microsoft Store，但 `py --version` 正常，可将示例中的 `python` 替换为 `py`。默认本地时区和 `--timezone UTC` 无需额外依赖；使用 `--timezone America/New_York` 等 IANA 命名时区时，若系统没有时区数据库（通常包括 Windows），先运行 `python -m pip install tzdata`。
 
 下载脚本到当前目录后，也可以运行：
 
@@ -148,7 +148,7 @@ Windows 控制台会自动启用终端控制，并在退出时恢复原模式；
 
 日志默认读取 `$CODEX_HOME`（未设置时为 `~/.codex`）下的 `sessions` 和 `archived_sessions`，可用 `--root` 替换。原始日志只读，不上传日志或读取凭据内容。`--json` 输出完整数据；watch 每帧输出一行 JSON。`period.selection` 标明 `current_cycle`、`explicit` 或 `fallback`；当前周期附带 `cycle_window` 和 `cycle_resets_at`，回退附带 `fallback_reason`。原有用量、成本和各维度 JSON 字段保留；新增 `period_summaries` 分别提供各期间的本地汇总、完整 `by_model` / `by_model_detail`、日期范围和来源，参考期间不改变原 `period` 或 `summary`。`--output` 不会覆盖程序或 JSONL 日志。
 
-日期默认使用本地时区；UTC 无需额外数据，其他命名时区依赖系统时区数据库。终端日期的时区标签按该时间点的实际偏移显示为 `UTC±HH:MM`，零偏移显示为 `UTC`。
+日期默认使用本地时区；UTC 无需额外数据，其他命名时区使用系统 IANA 数据库或 Python 官方维护的 [`tzdata`](https://docs.python.org/3/library/zoneinfo.html#data-sources) 包。缺少指定时区时会提示检查名称或安装 `tzdata`。终端日期的时区标签按该时间点的实际偏移显示为 `UTC±HH:MM`，零偏移显示为 `UTC`。
 
 ## 开发与测试
 
@@ -157,10 +157,11 @@ Windows 控制台会自动启用终端控制，并在退出时恢复原模式；
 运行测试：
 
 ```sh
+python3 -m pip install tzdata
 python3 -W error::ResourceWarning -m unittest discover -s tests -q
 ```
 
-CI 覆盖 Ubuntu 和 Windows，测试使用模拟 app-server；真实 Windows 账户、周期预测及 Ctrl+C 清理仍需实机验证。
+`tzdata` 是完整测试套件的依赖，确保命名时区、夏令时和午夜边界测试都实际运行。CI 在 Ubuntu 和 Windows 上安装它，并通过空 `PYTHONTZPATH` 强制验证包内数据来源。测试使用模拟 app-server；真实 Windows 账户、周期预测及 Ctrl+C 清理仍需实机验证。
 
 ## 许可证
 
