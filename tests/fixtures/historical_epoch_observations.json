@@ -1,0 +1,131 @@
+{
+  "provenance": "Wholly invented quota metadata for synthetic regression tests. Dates, percentages, plan labels and windows are fictional; no private logs or real account observations are included.",
+  "cases": {
+    "synthetic_early_window_a": [
+      {
+        "observer": "observer-1",
+        "observed_at": "2025-01-01T00:00:00+00:00",
+        "identity": [
+          "codex",
+          "primary",
+          10080,
+          "2025-01-04T00:00:00+00:00",
+          "synthetic-plan"
+        ],
+        "used_percent": 80
+      },
+      {
+        "observer": "observer-1",
+        "observed_at": "2025-01-01T00:00:20+00:00",
+        "identity": [
+          "codex",
+          "primary",
+          10080,
+          "2025-01-08T00:00:20+00:00",
+          "synthetic-plan"
+        ],
+        "used_percent": 0
+      }
+    ],
+    "synthetic_early_window_b": [
+      {
+        "observer": "observer-1",
+        "observed_at": "2025-02-01T00:00:00+00:00",
+        "identity": [
+          "codex",
+          "primary",
+          10080,
+          "2025-02-05T00:00:00+00:00",
+          "synthetic-plan-b"
+        ],
+        "used_percent": 75
+      },
+      {
+        "observer": "observer-1",
+        "observed_at": "2025-02-01T00:00:10+00:00",
+        "identity": [
+          "codex",
+          "primary",
+          10080,
+          "2025-02-08T00:00:10+00:00",
+          "synthetic-plan-b"
+        ],
+        "used_percent": 0
+      }
+    ],
+    "synthetic_old_window_interleaving": [
+      {
+        "observer": "observer-1",
+        "observed_at": "2025-03-01T00:00:00+00:00",
+        "identity": [
+          "codex",
+          "primary",
+          10080,
+          "2025-03-07T00:00:00+00:00",
+          "synthetic-plan"
+        ],
+        "used_percent": 60
+      },
+      {
+        "observer": "observer-2",
+        "observed_at": "2025-03-01T00:00:10+00:00",
+        "identity": [
+          "codex",
+          "primary",
+          10080,
+          "2025-03-08T00:00:00+00:00",
+          "synthetic-plan"
+        ],
+        "used_percent": 0
+      },
+      {
+        "observer": "observer-3",
+        "observed_at": "2025-03-01T00:00:20+00:00",
+        "identity": [
+          "codex",
+          "primary",
+          10080,
+          "2025-03-07T00:00:00+00:00",
+          "synthetic-plan"
+        ],
+        "used_percent": 60
+      },
+      {
+        "observer": "observer-2",
+        "observed_at": "2025-03-01T00:00:30+00:00",
+        "identity": [
+          "codex",
+          "primary",
+          10080,
+          "2025-03-08T00:00:30+00:00",
+          "synthetic-plan"
+        ],
+        "used_percent": 0
+      },
+      {
+        "observer": "observer-2",
+        "observed_at": "2025-03-01T00:00:40+00:00",
+        "identity": [
+          "codex",
+          "primary",
+          10080,
+          "2025-03-08T00:00:30+00:00",
+          "synthetic-plan"
+        ],
+        "used_percent": 0
+      },
+      {
+        "observer": "observer-3",
+        "observed_at": "2025-03-01T00:00:50+00:00",
+        "identity": [
+          "codex",
+          "primary",
+          10080,
+          "2025-03-08T00:00:30+00:00",
+          "synthetic-plan"
+        ],
+        "used_percent": 0
+      }
+    ]
+  }
+}

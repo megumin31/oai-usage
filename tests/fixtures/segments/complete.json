@@ -1,0 +1,187 @@
+{
+  "schema_version": 1,
+  "context": {
+    "account_key": "synthetic-account",
+    "plan_type": "pro",
+    "limit_id": "codex",
+    "window_kind": "secondary",
+    "mode": "standard"
+  },
+  "workload": {
+    "label": "Synthetic controlled workload; no real account data",
+    "models": [
+      "gpt-5.4-mini"
+    ],
+    "effort": "synthetic-fixed"
+  },
+  "collection_period": {
+    "start": "2026-09-22T00:00:00Z",
+    "end": "2026-09-22T01:00:00Z"
+  },
+  "selection_policy": "all_attempted_segments",
+  "snapshots": [
+    {
+      "id": "a",
+      "context": {
+        "account_key": "synthetic-account",
+        "plan_type": "pro",
+        "limit_id": "codex",
+        "window_kind": "secondary",
+        "mode": "standard"
+      },
+      "capture_started_at": "2026-09-22T00:00:00Z",
+      "observed_at": "2026-09-22T00:00:01Z",
+      "window_minutes": 10080,
+      "resets_at": "2026-09-29T00:00:00Z",
+      "used_percent": 10,
+      "percent_resolution": 1,
+      "source": "app_server_rpc",
+      "observation_basis": "retrieved_not_measured"
+    },
+    {
+      "id": "b",
+      "context": {
+        "account_key": "synthetic-account",
+        "plan_type": "pro",
+        "limit_id": "codex",
+        "window_kind": "secondary",
+        "mode": "standard"
+      },
+      "capture_started_at": "2026-09-22T00:10:00Z",
+      "observed_at": "2026-09-22T00:10:01Z",
+      "window_minutes": 10080,
+      "resets_at": "2026-09-29T00:00:00Z",
+      "used_percent": 15,
+      "percent_resolution": 1,
+      "source": "app_server_rpc",
+      "observation_basis": "retrieved_not_measured"
+    },
+    {
+      "id": "c",
+      "context": {
+        "account_key": "synthetic-account",
+        "plan_type": "pro",
+        "limit_id": "codex",
+        "window_kind": "secondary",
+        "mode": "standard"
+      },
+      "capture_started_at": "2026-09-22T00:20:00Z",
+      "observed_at": "2026-09-22T00:20:01Z",
+      "window_minutes": 10080,
+      "resets_at": "2026-09-29T00:00:00Z",
+      "used_percent": 15,
+      "percent_resolution": 1,
+      "source": "app_server_rpc",
+      "observation_basis": "retrieved_not_measured"
+    },
+    {
+      "id": "d",
+      "context": {
+        "account_key": "synthetic-account",
+        "plan_type": "pro",
+        "limit_id": "codex",
+        "window_kind": "secondary",
+        "mode": "standard"
+      },
+      "capture_started_at": "2026-09-22T00:30:00Z",
+      "observed_at": "2026-09-22T00:30:01Z",
+      "window_minutes": 10080,
+      "resets_at": "2026-09-29T00:00:00Z",
+      "used_percent": 30,
+      "percent_resolution": 1,
+      "source": "app_server_rpc",
+      "observation_basis": "retrieved_not_measured"
+    }
+  ],
+  "segments": [
+    {
+      "id": "one",
+      "before": "a",
+      "after": "b",
+      "assertions": {
+        "complete_local_receipts": true,
+        "no_other_device_usage": true,
+        "no_boundary_inflight": true,
+        "settlement_assumed": true,
+        "pool_attribution": true
+      }
+    },
+    {
+      "id": "two-zero-delta",
+      "before": "b",
+      "after": "c",
+      "assertions": {
+        "complete_local_receipts": true,
+        "no_other_device_usage": true,
+        "no_boundary_inflight": true,
+        "settlement_assumed": true,
+        "pool_attribution": true
+      }
+    },
+    {
+      "id": "three",
+      "before": "c",
+      "after": "d",
+      "assertions": {
+        "complete_local_receipts": true,
+        "no_other_device_usage": true,
+        "no_boundary_inflight": true,
+        "settlement_assumed": true,
+        "pool_attribution": true
+      }
+    }
+  ],
+  "receipts": [
+    {
+      "response_id": "one",
+      "thread_id": "local-a",
+      "owner_thread_id": "local-a",
+      "owner_created_at": "2026-09-22T00:00:00Z",
+      "started_at": "2026-09-22T00:01:00Z",
+      "completed_at": "2026-09-22T00:05:00Z",
+      "model": "gpt-5.4-mini",
+      "usage": {
+        "input_tokens": 100000,
+        "cached_input_tokens": 0,
+        "cache_write_input_tokens": 0,
+        "output_tokens": 0,
+        "reasoning_output_tokens": 0,
+        "total_tokens": 100000
+      }
+    },
+    {
+      "response_id": "two",
+      "thread_id": "local-a",
+      "owner_thread_id": "local-a",
+      "owner_created_at": "2026-09-22T00:00:00Z",
+      "started_at": "2026-09-22T00:11:00Z",
+      "completed_at": "2026-09-22T00:15:00Z",
+      "model": "gpt-5.4-mini",
+      "usage": {
+        "input_tokens": 200000,
+        "cached_input_tokens": 0,
+        "cache_write_input_tokens": 0,
+        "output_tokens": 0,
+        "reasoning_output_tokens": 0,
+        "total_tokens": 200000
+      }
+    },
+    {
+      "response_id": "three",
+      "thread_id": "local-a",
+      "owner_thread_id": "local-a",
+      "owner_created_at": "2026-09-22T00:00:00Z",
+      "started_at": "2026-09-22T00:21:00Z",
+      "completed_at": "2026-09-22T00:25:00Z",
+      "model": "gpt-5.4-mini",
+      "usage": {
+        "input_tokens": 600000,
+        "cached_input_tokens": 0,
+        "cache_write_input_tokens": 0,
+        "output_tokens": 0,
+        "reasoning_output_tokens": 0,
+        "total_tokens": 600000
+      }
+    }
+  ]
+}

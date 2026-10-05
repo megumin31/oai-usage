@@ -1,0 +1,22 @@
+{
+  "basis": "standard_api_equivalent",
+  "provider": "openai",
+  "verified_at": "2026-09-22",
+  "source": "https://models.dev/api.json",
+  "models": {
+    "synthetic-astra": {
+      "input": "1",
+      "cached_input": "0.2",
+      "cache_write": "1.5",
+      "output": "2",
+      "long_context": null
+    },
+    "synthetic-sol": {
+      "input": "1",
+      "cached_input": "0.2",
+      "cache_write": "1.5",
+      "output": "2",
+      "long_context": null
+    }
+  }
+}

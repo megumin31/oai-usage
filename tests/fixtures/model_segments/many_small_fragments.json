@@ -1,0 +1,730 @@
+{
+  "schema_version": 2,
+  "context": {
+    "account_key": "fictional-account-no-real-data",
+    "plan_type": "synthetic-plan",
+    "limit_id": "synthetic-shared-pool",
+    "window_kind": "secondary",
+    "mode": "synthetic-mode"
+  },
+  "label": "FICTIONAL invented $1/M rates; 10 independent 2pp fragments have 20pp total but unbounded unknown-rounding uncertainty",
+  "workloads": [
+    {
+      "id": "astra-standard",
+      "model": "synthetic-astra",
+      "speed": "standard",
+      "effort": "high",
+      "cache_workload": "uncached-input-only"
+    },
+    {
+      "id": "sol-standard",
+      "model": "synthetic-sol",
+      "speed": "standard",
+      "effort": "high",
+      "cache_workload": "uncached-input-only"
+    }
+  ],
+  "quantization": {
+    "rounding": "unknown"
+  },
+  "current_snapshot": "current",
+  "collection_period": {
+    "start": "2026-09-22T00:00:00Z",
+    "end": "2026-09-22T02:00:00Z"
+  },
+  "selection_policy": "all_attempted_segments",
+  "snapshots": [
+    {
+      "id": "before-0",
+      "context": {
+        "account_key": "fictional-account-no-real-data",
+        "plan_type": "synthetic-plan",
+        "limit_id": "synthetic-shared-pool",
+        "window_kind": "secondary",
+        "mode": "synthetic-mode"
+      },
+      "capture_started_at": "2026-09-22T00:00:00Z",
+      "observed_at": "2026-09-22T00:00:01Z",
+      "window_minutes": 10080,
+      "resets_at": "2026-09-29T00:00:00Z",
+      "used_percent": 10,
+      "percent_resolution": 1,
+      "source": "app_server_rpc",
+      "observation_basis": "retrieved_not_measured"
+    },
+    {
+      "id": "after-0",
+      "context": {
+        "account_key": "fictional-account-no-real-data",
+        "plan_type": "synthetic-plan",
+        "limit_id": "synthetic-shared-pool",
+        "window_kind": "secondary",
+        "mode": "synthetic-mode"
+      },
+      "capture_started_at": "2026-09-22T00:08:20Z",
+      "observed_at": "2026-09-22T00:08:21Z",
+      "window_minutes": 10080,
+      "resets_at": "2026-09-29T00:00:00Z",
+      "used_percent": 12,
+      "percent_resolution": 1,
+      "source": "app_server_rpc",
+      "observation_basis": "retrieved_not_measured"
+    },
+    {
+      "id": "before-1",
+      "context": {
+        "account_key": "fictional-account-no-real-data",
+        "plan_type": "synthetic-plan",
+        "limit_id": "synthetic-shared-pool",
+        "window_kind": "secondary",
+        "mode": "synthetic-mode"
+      },
+      "capture_started_at": "2026-09-22T00:10:00Z",
+      "observed_at": "2026-09-22T00:10:01Z",
+      "window_minutes": 10080,
+      "resets_at": "2026-09-29T00:00:00Z",
+      "used_percent": 14,
+      "percent_resolution": 1,
+      "source": "app_server_rpc",
+      "observation_basis": "retrieved_not_measured"
+    },
+    {
+      "id": "after-1",
+      "context": {
+        "account_key": "fictional-account-no-real-data",
+        "plan_type": "synthetic-plan",
+        "limit_id": "synthetic-shared-pool",
+        "window_kind": "secondary",
+        "mode": "synthetic-mode"
+      },
+      "capture_started_at": "2026-09-22T00:18:20Z",
+      "observed_at": "2026-09-22T00:18:21Z",
+      "window_minutes": 10080,
+      "resets_at": "2026-09-29T00:00:00Z",
+      "used_percent": 16,
+      "percent_resolution": 1,
+      "source": "app_server_rpc",
+      "observation_basis": "retrieved_not_measured"
+    },
+    {
+      "id": "before-2",
+      "context": {
+        "account_key": "fictional-account-no-real-data",
+        "plan_type": "synthetic-plan",
+        "limit_id": "synthetic-shared-pool",
+        "window_kind": "secondary",
+        "mode": "synthetic-mode"
+      },
+      "capture_started_at": "2026-09-22T00:20:00Z",
+      "observed_at": "2026-09-22T00:20:01Z",
+      "window_minutes": 10080,
+      "resets_at": "2026-09-29T00:00:00Z",
+      "used_percent": 18,
+      "percent_resolution": 1,
+      "source": "app_server_rpc",
+      "observation_basis": "retrieved_not_measured"
+    },
+    {
+      "id": "after-2",
+      "context": {
+        "account_key": "fictional-account-no-real-data",
+        "plan_type": "synthetic-plan",
+        "limit_id": "synthetic-shared-pool",
+        "window_kind": "secondary",
+        "mode": "synthetic-mode"
+      },
+      "capture_started_at": "2026-09-22T00:28:20Z",
+      "observed_at": "2026-09-22T00:28:21Z",
+      "window_minutes": 10080,
+      "resets_at": "2026-09-29T00:00:00Z",
+      "used_percent": 20,
+      "percent_resolution": 1,
+      "source": "app_server_rpc",
+      "observation_basis": "retrieved_not_measured"
+    },
+    {
+      "id": "before-3",
+      "context": {
+        "account_key": "fictional-account-no-real-data",
+        "plan_type": "synthetic-plan",
+        "limit_id": "synthetic-shared-pool",
+        "window_kind": "secondary",
+        "mode": "synthetic-mode"
+      },
+      "capture_started_at": "2026-09-22T00:30:00Z",
+      "observed_at": "2026-09-22T00:30:01Z",
+      "window_minutes": 10080,
+      "resets_at": "2026-09-29T00:00:00Z",
+      "used_percent": 22,
+      "percent_resolution": 1,
+      "source": "app_server_rpc",
+      "observation_basis": "retrieved_not_measured"
+    },
+    {
+      "id": "after-3",
+      "context": {
+        "account_key": "fictional-account-no-real-data",
+        "plan_type": "synthetic-plan",
+        "limit_id": "synthetic-shared-pool",
+        "window_kind": "secondary",
+        "mode": "synthetic-mode"
+      },
+      "capture_started_at": "2026-09-22T00:38:20Z",
+      "observed_at": "2026-09-22T00:38:21Z",
+      "window_minutes": 10080,
+      "resets_at": "2026-09-29T00:00:00Z",
+      "used_percent": 24,
+      "percent_resolution": 1,
+      "source": "app_server_rpc",
+      "observation_basis": "retrieved_not_measured"
+    },
+    {
+      "id": "before-4",
+      "context": {
+        "account_key": "fictional-account-no-real-data",
+        "plan_type": "synthetic-plan",
+        "limit_id": "synthetic-shared-pool",
+        "window_kind": "secondary",
+        "mode": "synthetic-mode"
+      },
+      "capture_started_at": "2026-09-22T00:40:00Z",
+      "observed_at": "2026-09-22T00:40:01Z",
+      "window_minutes": 10080,
+      "resets_at": "2026-09-29T00:00:00Z",
+      "used_percent": 26,
+      "percent_resolution": 1,
+      "source": "app_server_rpc",
+      "observation_basis": "retrieved_not_measured"
+    },
+    {
+      "id": "after-4",
+      "context": {
+        "account_key": "fictional-account-no-real-data",
+        "plan_type": "synthetic-plan",
+        "limit_id": "synthetic-shared-pool",
+        "window_kind": "secondary",
+        "mode": "synthetic-mode"
+      },
+      "capture_started_at": "2026-09-22T00:48:20Z",
+      "observed_at": "2026-09-22T00:48:21Z",
+      "window_minutes": 10080,
+      "resets_at": "2026-09-29T00:00:00Z",
+      "used_percent": 28,
+      "percent_resolution": 1,
+      "source": "app_server_rpc",
+      "observation_basis": "retrieved_not_measured"
+    },
+    {
+      "id": "before-5",
+      "context": {
+        "account_key": "fictional-account-no-real-data",
+        "plan_type": "synthetic-plan",
+        "limit_id": "synthetic-shared-pool",
+        "window_kind": "secondary",
+        "mode": "synthetic-mode"
+      },
+      "capture_started_at": "2026-09-22T00:50:00Z",
+      "observed_at": "2026-09-22T00:50:01Z",
+      "window_minutes": 10080,
+      "resets_at": "2026-09-29T00:00:00Z",
+      "used_percent": 30,
+      "percent_resolution": 1,
+      "source": "app_server_rpc",
+      "observation_basis": "retrieved_not_measured"
+    },
+    {
+      "id": "after-5",
+      "context": {
+        "account_key": "fictional-account-no-real-data",
+        "plan_type": "synthetic-plan",
+        "limit_id": "synthetic-shared-pool",
+        "window_kind": "secondary",
+        "mode": "synthetic-mode"
+      },
+      "capture_started_at": "2026-09-22T00:58:20Z",
+      "observed_at": "2026-09-22T00:58:21Z",
+      "window_minutes": 10080,
+      "resets_at": "2026-09-29T00:00:00Z",
+      "used_percent": 32,
+      "percent_resolution": 1,
+      "source": "app_server_rpc",
+      "observation_basis": "retrieved_not_measured"
+    },
+    {
+      "id": "before-6",
+      "context": {
+        "account_key": "fictional-account-no-real-data",
+        "plan_type": "synthetic-plan",
+        "limit_id": "synthetic-shared-pool",
+        "window_kind": "secondary",
+        "mode": "synthetic-mode"
+      },
+      "capture_started_at": "2026-09-22T01:00:00Z",
+      "observed_at": "2026-09-22T01:00:01Z",
+      "window_minutes": 10080,
+      "resets_at": "2026-09-29T00:00:00Z",
+      "used_percent": 34,
+      "percent_resolution": 1,
+      "source": "app_server_rpc",
+      "observation_basis": "retrieved_not_measured"
+    },
+    {
+      "id": "after-6",
+      "context": {
+        "account_key": "fictional-account-no-real-data",
+        "plan_type": "synthetic-plan",
+        "limit_id": "synthetic-shared-pool",
+        "window_kind": "secondary",
+        "mode": "synthetic-mode"
+      },
+      "capture_started_at": "2026-09-22T01:08:20Z",
+      "observed_at": "2026-09-22T01:08:21Z",
+      "window_minutes": 10080,
+      "resets_at": "2026-09-29T00:00:00Z",
+      "used_percent": 36,
+      "percent_resolution": 1,
+      "source": "app_server_rpc",
+      "observation_basis": "retrieved_not_measured"
+    },
+    {
+      "id": "before-7",
+      "context": {
+        "account_key": "fictional-account-no-real-data",
+        "plan_type": "synthetic-plan",
+        "limit_id": "synthetic-shared-pool",
+        "window_kind": "secondary",
+        "mode": "synthetic-mode"
+      },
+      "capture_started_at": "2026-09-22T01:10:00Z",
+      "observed_at": "2026-09-22T01:10:01Z",
+      "window_minutes": 10080,
+      "resets_at": "2026-09-29T00:00:00Z",
+      "used_percent": 38,
+      "percent_resolution": 1,
+      "source": "app_server_rpc",
+      "observation_basis": "retrieved_not_measured"
+    },
+    {
+      "id": "after-7",
+      "context": {
+        "account_key": "fictional-account-no-real-data",
+        "plan_type": "synthetic-plan",
+        "limit_id": "synthetic-shared-pool",
+        "window_kind": "secondary",
+        "mode": "synthetic-mode"
+      },
+      "capture_started_at": "2026-09-22T01:18:20Z",
+      "observed_at": "2026-09-22T01:18:21Z",
+      "window_minutes": 10080,
+      "resets_at": "2026-09-29T00:00:00Z",
+      "used_percent": 40,
+      "percent_resolution": 1,
+      "source": "app_server_rpc",
+      "observation_basis": "retrieved_not_measured"
+    },
+    {
+      "id": "before-8",
+      "context": {
+        "account_key": "fictional-account-no-real-data",
+        "plan_type": "synthetic-plan",
+        "limit_id": "synthetic-shared-pool",
+        "window_kind": "secondary",
+        "mode": "synthetic-mode"
+      },
+      "capture_started_at": "2026-09-22T01:20:00Z",
+      "observed_at": "2026-09-22T01:20:01Z",
+      "window_minutes": 10080,
+      "resets_at": "2026-09-29T00:00:00Z",
+      "used_percent": 42,
+      "percent_resolution": 1,
+      "source": "app_server_rpc",
+      "observation_basis": "retrieved_not_measured"
+    },
+    {
+      "id": "after-8",
+      "context": {
+        "account_key": "fictional-account-no-real-data",
+        "plan_type": "synthetic-plan",
+        "limit_id": "synthetic-shared-pool",
+        "window_kind": "secondary",
+        "mode": "synthetic-mode"
+      },
+      "capture_started_at": "2026-09-22T01:28:20Z",
+      "observed_at": "2026-09-22T01:28:21Z",
+      "window_minutes": 10080,
+      "resets_at": "2026-09-29T00:00:00Z",
+      "used_percent": 44,
+      "percent_resolution": 1,
+      "source": "app_server_rpc",
+      "observation_basis": "retrieved_not_measured"
+    },
+    {
+      "id": "before-9",
+      "context": {
+        "account_key": "fictional-account-no-real-data",
+        "plan_type": "synthetic-plan",
+        "limit_id": "synthetic-shared-pool",
+        "window_kind": "secondary",
+        "mode": "synthetic-mode"
+      },
+      "capture_started_at": "2026-09-22T01:30:00Z",
+      "observed_at": "2026-09-22T01:30:01Z",
+      "window_minutes": 10080,
+      "resets_at": "2026-09-29T00:00:00Z",
+      "used_percent": 46,
+      "percent_resolution": 1,
+      "source": "app_server_rpc",
+      "observation_basis": "retrieved_not_measured"
+    },
+    {
+      "id": "after-9",
+      "context": {
+        "account_key": "fictional-account-no-real-data",
+        "plan_type": "synthetic-plan",
+        "limit_id": "synthetic-shared-pool",
+        "window_kind": "secondary",
+        "mode": "synthetic-mode"
+      },
+      "capture_started_at": "2026-09-22T01:38:20Z",
+      "observed_at": "2026-09-22T01:38:21Z",
+      "window_minutes": 10080,
+      "resets_at": "2026-09-29T00:00:00Z",
+      "used_percent": 48,
+      "percent_resolution": 1,
+      "source": "app_server_rpc",
+      "observation_basis": "retrieved_not_measured"
+    },
+    {
+      "id": "current",
+      "context": {
+        "account_key": "fictional-account-no-real-data",
+        "plan_type": "synthetic-plan",
+        "limit_id": "synthetic-shared-pool",
+        "window_kind": "secondary",
+        "mode": "synthetic-mode"
+      },
+      "capture_started_at": "2026-09-22T01:55:00Z",
+      "observed_at": "2026-09-22T01:55:01Z",
+      "window_minutes": 10080,
+      "resets_at": "2026-09-29T00:00:00Z",
+      "used_percent": 60,
+      "percent_resolution": 1,
+      "source": "app_server_rpc",
+      "observation_basis": "retrieved_not_measured"
+    }
+  ],
+  "segments": [
+    {
+      "id": "fragment-0",
+      "before": "before-0",
+      "after": "after-0",
+      "workload_id": "astra-standard",
+      "assertions": {
+        "complete_local_receipts": true,
+        "no_other_device_usage": true,
+        "no_boundary_inflight": true,
+        "settlement_assumed": true,
+        "pool_attribution": true
+      }
+    },
+    {
+      "id": "fragment-1",
+      "before": "before-1",
+      "after": "after-1",
+      "workload_id": "astra-standard",
+      "assertions": {
+        "complete_local_receipts": true,
+        "no_other_device_usage": true,
+        "no_boundary_inflight": true,
+        "settlement_assumed": true,
+        "pool_attribution": true
+      }
+    },
+    {
+      "id": "fragment-2",
+      "before": "before-2",
+      "after": "after-2",
+      "workload_id": "astra-standard",
+      "assertions": {
+        "complete_local_receipts": true,
+        "no_other_device_usage": true,
+        "no_boundary_inflight": true,
+        "settlement_assumed": true,
+        "pool_attribution": true
+      }
+    },
+    {
+      "id": "fragment-3",
+      "before": "before-3",
+      "after": "after-3",
+      "workload_id": "astra-standard",
+      "assertions": {
+        "complete_local_receipts": true,
+        "no_other_device_usage": true,
+        "no_boundary_inflight": true,
+        "settlement_assumed": true,
+        "pool_attribution": true
+      }
+    },
+    {
+      "id": "fragment-4",
+      "before": "before-4",
+      "after": "after-4",
+      "workload_id": "astra-standard",
+      "assertions": {
+        "complete_local_receipts": true,
+        "no_other_device_usage": true,
+        "no_boundary_inflight": true,
+        "settlement_assumed": true,
+        "pool_attribution": true
+      }
+    },
+    {
+      "id": "fragment-5",
+      "before": "before-5",
+      "after": "after-5",
+      "workload_id": "astra-standard",
+      "assertions": {
+        "complete_local_receipts": true,
+        "no_other_device_usage": true,
+        "no_boundary_inflight": true,
+        "settlement_assumed": true,
+        "pool_attribution": true
+      }
+    },
+    {
+      "id": "fragment-6",
+      "before": "before-6",
+      "after": "after-6",
+      "workload_id": "astra-standard",
+      "assertions": {
+        "complete_local_receipts": true,
+        "no_other_device_usage": true,
+        "no_boundary_inflight": true,
+        "settlement_assumed": true,
+        "pool_attribution": true
+      }
+    },
+    {
+      "id": "fragment-7",
+      "before": "before-7",
+      "after": "after-7",
+      "workload_id": "astra-standard",
+      "assertions": {
+        "complete_local_receipts": true,
+        "no_other_device_usage": true,
+        "no_boundary_inflight": true,
+        "settlement_assumed": true,
+        "pool_attribution": true
+      }
+    },
+    {
+      "id": "fragment-8",
+      "before": "before-8",
+      "after": "after-8",
+      "workload_id": "astra-standard",
+      "assertions": {
+        "complete_local_receipts": true,
+        "no_other_device_usage": true,
+        "no_boundary_inflight": true,
+        "settlement_assumed": true,
+        "pool_attribution": true
+      }
+    },
+    {
+      "id": "fragment-9",
+      "before": "before-9",
+      "after": "after-9",
+      "workload_id": "astra-standard",
+      "assertions": {
+        "complete_local_receipts": true,
+        "no_other_device_usage": true,
+        "no_boundary_inflight": true,
+        "settlement_assumed": true,
+        "pool_attribution": true
+      }
+    }
+  ],
+  "receipts": [
+    {
+      "response_id": "fragment-0",
+      "thread_id": "fictional-thread-astra-1",
+      "owner_thread_id": "fictional-thread-astra-1",
+      "owner_created_at": "2026-09-22T00:00:00Z",
+      "started_at": "2026-09-22T00:01:00Z",
+      "completed_at": "2026-09-22T00:05:00Z",
+      "model": "synthetic-astra",
+      "workload_id": "astra-standard",
+      "usage": {
+        "input_tokens": 1500000,
+        "cached_input_tokens": 0,
+        "cache_write_input_tokens": 0,
+        "output_tokens": 0,
+        "reasoning_output_tokens": 0,
+        "total_tokens": 1500000
+      }
+    },
+    {
+      "response_id": "fragment-1",
+      "thread_id": "fictional-thread-astra-1",
+      "owner_thread_id": "fictional-thread-astra-1",
+      "owner_created_at": "2026-09-22T00:00:00Z",
+      "started_at": "2026-09-22T00:11:00Z",
+      "completed_at": "2026-09-22T00:15:00Z",
+      "model": "synthetic-astra",
+      "workload_id": "astra-standard",
+      "usage": {
+        "input_tokens": 1500000,
+        "cached_input_tokens": 0,
+        "cache_write_input_tokens": 0,
+        "output_tokens": 0,
+        "reasoning_output_tokens": 0,
+        "total_tokens": 1500000
+      }
+    },
+    {
+      "response_id": "fragment-2",
+      "thread_id": "fictional-thread-astra-1",
+      "owner_thread_id": "fictional-thread-astra-1",
+      "owner_created_at": "2026-09-22T00:00:00Z",
+      "started_at": "2026-09-22T00:21:00Z",
+      "completed_at": "2026-09-22T00:25:00Z",
+      "model": "synthetic-astra",
+      "workload_id": "astra-standard",
+      "usage": {
+        "input_tokens": 1500000,
+        "cached_input_tokens": 0,
+        "cache_write_input_tokens": 0,
+        "output_tokens": 0,
+        "reasoning_output_tokens": 0,
+        "total_tokens": 1500000
+      }
+    },
+    {
+      "response_id": "fragment-3",
+      "thread_id": "fictional-thread-astra-1",
+      "owner_thread_id": "fictional-thread-astra-1",
+      "owner_created_at": "2026-09-22T00:00:00Z",
+      "started_at": "2026-09-22T00:31:00Z",
+      "completed_at": "2026-09-22T00:35:00Z",
+      "model": "synthetic-astra",
+      "workload_id": "astra-standard",
+      "usage": {
+        "input_tokens": 1500000,
+        "cached_input_tokens": 0,
+        "cache_write_input_tokens": 0,
+        "output_tokens": 0,
+        "reasoning_output_tokens": 0,
+        "total_tokens": 1500000
+      }
+    },
+    {
+      "response_id": "fragment-4",
+      "thread_id": "fictional-thread-astra-1",
+      "owner_thread_id": "fictional-thread-astra-1",
+      "owner_created_at": "2026-09-22T00:00:00Z",
+      "started_at": "2026-09-22T00:41:00Z",
+      "completed_at": "2026-09-22T00:45:00Z",
+      "model": "synthetic-astra",
+      "workload_id": "astra-standard",
+      "usage": {
+        "input_tokens": 1500000,
+        "cached_input_tokens": 0,
+        "cache_write_input_tokens": 0,
+        "output_tokens": 0,
+        "reasoning_output_tokens": 0,
+        "total_tokens": 1500000
+      }
+    },
+    {
+      "response_id": "fragment-5",
+      "thread_id": "fictional-thread-astra-1",
+      "owner_thread_id": "fictional-thread-astra-1",
+      "owner_created_at": "2026-09-22T00:00:00Z",
+      "started_at": "2026-09-22T00:51:00Z",
+      "completed_at": "2026-09-22T00:55:00Z",
+      "model": "synthetic-astra",
+      "workload_id": "astra-standard",
+      "usage": {
+        "input_tokens": 1500000,
+        "cached_input_tokens": 0,
+        "cache_write_input_tokens": 0,
+        "output_tokens": 0,
+        "reasoning_output_tokens": 0,
+        "total_tokens": 1500000
+      }
+    },
+    {
+      "response_id": "fragment-6",
+      "thread_id": "fictional-thread-astra-1",
+      "owner_thread_id": "fictional-thread-astra-1",
+      "owner_created_at": "2026-09-22T00:00:00Z",
+      "started_at": "2026-09-22T01:01:00Z",
+      "completed_at": "2026-09-22T01:05:00Z",
+      "model": "synthetic-astra",
+      "workload_id": "astra-standard",
+      "usage": {
+        "input_tokens": 1500000,
+        "cached_input_tokens": 0,
+        "cache_write_input_tokens": 0,
+        "output_tokens": 0,
+        "reasoning_output_tokens": 0,
+        "total_tokens": 1500000
+      }
+    },
+    {
+      "response_id": "fragment-7",
+      "thread_id": "fictional-thread-astra-1",
+      "owner_thread_id": "fictional-thread-astra-1",
+      "owner_created_at": "2026-09-22T00:00:00Z",
+      "started_at": "2026-09-22T01:11:00Z",
+      "completed_at": "2026-09-22T01:15:00Z",
+      "model": "synthetic-astra",
+      "workload_id": "astra-standard",
+      "usage": {
+        "input_tokens": 1500000,
+        "cached_input_tokens": 0,
+        "cache_write_input_tokens": 0,
+        "output_tokens": 0,
+        "reasoning_output_tokens": 0,
+        "total_tokens": 1500000
+      }
+    },
+    {
+      "response_id": "fragment-8",
+      "thread_id": "fictional-thread-astra-1",
+      "owner_thread_id": "fictional-thread-astra-1",
+      "owner_created_at": "2026-09-22T00:00:00Z",
+      "started_at": "2026-09-22T01:21:00Z",
+      "completed_at": "2026-09-22T01:25:00Z",
+      "model": "synthetic-astra",
+      "workload_id": "astra-standard",
+      "usage": {
+        "input_tokens": 1500000,
+        "cached_input_tokens": 0,
+        "cache_write_input_tokens": 0,
+        "output_tokens": 0,
+        "reasoning_output_tokens": 0,
+        "total_tokens": 1500000
+      }
+    },
+    {
+      "response_id": "fragment-9",
+      "thread_id": "fictional-thread-astra-1",
+      "owner_thread_id": "fictional-thread-astra-1",
+      "owner_created_at": "2026-09-22T00:00:00Z",
+      "started_at": "2026-09-22T01:31:00Z",
+      "completed_at": "2026-09-22T01:35:00Z",
+      "model": "synthetic-astra",
+      "workload_id": "astra-standard",
+      "usage": {
+        "input_tokens": 1500000,
+        "cached_input_tokens": 0,
+        "cache_write_input_tokens": 0,
+        "output_tokens": 0,
+        "reasoning_output_tokens": 0,
+        "total_tokens": 1500000
+      }
+    }
+  ]
+}
