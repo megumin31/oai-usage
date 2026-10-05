@@ -602,7 +602,7 @@ class SegmentCli(unittest.TestCase):
         self.env = dict(os.environ, HOME=str(self.root), CODEX_HOME=str(self.root / 'synthetic-codex-home'))
         # Site customization runs before the actual executable. Any accidental
         # network or default-session access fails rather than reading private logs.
-        (self.root / 'sitecustomize.py').write_text('''import os, sys\ndef guard(event, args):\n    if event in ("socket.connect", "socket.getaddrinfo", "socket.gethostbyname"):\n        raise RuntimeError("offline test forbids network")\n    if event in ("open", "os.scandir", "os.listdir") and args:\n        path = str(args[0])\n        if "sessions" in path or "archived_sessions" in path:\n            raise RuntimeError("segment test forbids session access")\nsys.addaudithook(guard)\n''')
+        (self.root / 'sitecustomize.py').write_text('''import os, sys\n# Windows asyncio creates a loopback socketpair for its internal wakeup pipe.\n# Build that test infrastructure before forbidding every application connection.\n# asyncio.run owns and closes this one precreated loop as usual.\nimport asyncio\n_offline_loop = asyncio.new_event_loop()\nasyncio.events.new_event_loop = lambda: _offline_loop\ndef guard(event, args):\n    if event in ("socket.connect", "socket.getaddrinfo", "socket.gethostbyname"):\n        raise RuntimeError("offline test forbids network")\n    if event in ("open", "os.scandir", "os.listdir") and args:\n        path = str(args[0])\n        if "sessions" in path or "archived_sessions" in path:\n            raise RuntimeError("segment test forbids session access")\nsys.addaudithook(guard)\n''')
         self.env['PYTHONPATH'] = str(self.root)
 
     def cli(self, *args):

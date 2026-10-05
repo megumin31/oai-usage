@@ -699,6 +699,12 @@ class ModelSegmentCli(unittest.TestCase):
         self.env = dict(os.environ, HOME=str(self.root), CODEX_HOME=str(self.root / 'fictional-codex-home'),
                         PYTHONPATH=str(self.root))
         (self.root / 'sitecustomize.py').write_text('''import sys
+# Windows asyncio creates a loopback socketpair for its internal wakeup pipe.
+# Build that test infrastructure before forbidding every application connection.
+# asyncio.run owns and closes this one precreated loop as usual.
+import asyncio
+_offline_loop = asyncio.new_event_loop()
+asyncio.events.new_event_loop = lambda: _offline_loop
 
 def guard(event, args):
     if event in ('socket.connect', 'socket.getaddrinfo', 'socket.gethostbyname'):
