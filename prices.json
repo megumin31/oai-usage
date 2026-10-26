@@ -1,7 +1,7 @@
 {
   "basis": "standard_api_equivalent",
   "provider": "openai",
-  "verified_at": "2026-10-02",
+  "verified_at": "2026-10-26",
   "source": "https://models.dev/api.json",
   "models": {
     "gpt-5.4": {
@@ -171,6 +171,19 @@
         "cached_input": "0.2",
         "cache_write": "5",
         "output": "15",
+        "threshold": 272000
+      }
+    },
+    "gpt-6.1-terra": {
+      "input": "1",
+      "cached_input": "0.05",
+      "cache_write": "1.25",
+      "output": "5",
+      "long_context": {
+        "input": "2",
+        "cached_input": "0.1",
+        "cache_write": "2.5",
+        "output": "7.5",
         "threshold": 272000
       }
     }
